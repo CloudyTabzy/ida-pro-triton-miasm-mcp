@@ -4,14 +4,14 @@ Guidance for working in this repository.
 
 ## What this project is
 
-IDA Pro MCP Server: exposes IDA Pro / idalib functionality to MCP clients.
+Fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) that adds **Triton symbolic execution** and **Miasm IR analysis** as native built-in tool modules.
 
 Main pieces:
 - `src/ida_pro_mcp/server.py`: MCP server entrypoint
 - `src/ida_pro_mcp/idalib_server.py`: headless idalib server
 - `src/ida_pro_mcp/ida_mcp/`: IDA/plugin-side APIs
 
-Important API modules:
+Core API modules (upstream):
 - `api_core.py`: IDB metadata, functions, strings, imports
 - `api_analysis.py`: decompilation, disassembly, xrefs, paths, pattern search
 - `api_memory.py`: bytes/ints/strings, patching
@@ -22,6 +22,35 @@ Important API modules:
 - `api_debug.py`: debugger control, unsafe / low priority for tests
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://` MCP resources
+
+Optional analysis engine modules (this fork):
+- `api_triton.py`: Triton symbolic execution — 32 tools covering context lifecycle, symbolization, concrete values, instruction processing, taint analysis, SMT solving, and snapshots. Requires `pip install triton-library`.
+- `api_miasm.py`: Miasm IR analysis — 14 tools covering IR lifting, SSA, CFG analysis, dead-code elimination, symbolic emulation, data-flow tracing, and cross-arch assembly/patching. Requires `pip install miasm future`.
+
+## Optional-import pattern
+
+Both `api_triton.py` and `api_miasm.py` guard their tool registrations so the plugin loads cleanly when the engine is absent:
+
+```python
+try:
+    import triton as _triton_lib
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+
+# One status probe tool is always registered (outside the guard)
+@tool
+@idasync
+def triton_status() -> str: ...
+
+# All other tools are inside the guard
+if TRITON_AVAILABLE:
+    @tool
+    @idasync
+    def triton_init(...): ...
+```
+
+`__init__.py` imports both modules inside `try/except Exception: pass` so a bad install can't break the plugin.
 
 ## Core implementation rules
 
@@ -37,6 +66,8 @@ from .sync import idasync
 def my_tool(...):
     ...
 ```
+
+Decorator order matters: `@tool` is outer, `@idasync` is inner.
 
 ### API conventions
 - Prefer batch-first APIs.
@@ -142,6 +173,8 @@ High priority:
 - `api_memory.py`
 - `api_core.py`
 - `api_resources.py`
+- `api_triton.py`
+- `api_miasm.py`
 - `utils.py`
 - `framework.py`
 

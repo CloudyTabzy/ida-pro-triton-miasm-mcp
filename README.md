@@ -44,7 +44,12 @@ pip install triton-library
 
 # Miasm IR analysis framework
 pip install miasm future
+
+# Both at once via package extras
+pip install "ida-pro-triton-miasm-mcp[all]"
 ```
+
+> **Forked from** [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) — upstream core IDA tools, zeromcp transport, and idalib support are from that project.
 
 ### Triton tools (23 tools)
 
