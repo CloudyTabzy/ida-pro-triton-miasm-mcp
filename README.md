@@ -51,7 +51,7 @@ pip install "ida-pro-triton-miasm-mcp[all]"
 
 > **Forked from** [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) — upstream core IDA tools, zeromcp transport, and idalib support are from that project.
 
-### Triton tools (23 tools)
+### Triton tools (34 tools)
 
 All tools require `pip install triton-library`. Architecture is auto-detected from the loaded binary.
 
@@ -82,8 +82,10 @@ All tools require `pip install triton-library`. Architecture is auto-detected fr
 | `triton_simplify_expression` | Algebraically simplify an expression |
 | `triton_lift_to_smt` | Export an expression as SMT-LIB2 |
 | `triton_snapshot_save` / `_restore` / `_list` / `_delete` | Context snapshots for branch exploration |
+| `triton_analyze_function` | **Compound:** init → symbolize args → process function → Z3 solve, all in one call |
+| `triton_find_input_for_branch` | **Compound:** CFG-guided Z3 search — find inputs that drive execution to a specific address |
 
-### Miasm tools (14 tools)
+### Miasm tools (18 tools)
 
 All tools require `pip install miasm future`. Architecture is auto-detected from the loaded binary.
 
@@ -91,6 +93,10 @@ All tools require `pip install miasm future`. Architecture is auto-detected from
 |------|-------------|
 | `miasm_status` | Report availability and architecture state (always available) |
 | `miasm_sync` | Re-sync architecture with IDA |
+| `miasm_init` | Explicit (re-)initialization, optional architecture override |
+| `miasm_get_context_info` | Detailed session info: arch, bitness, endianness, procname |
+| `miasm_reset` | Rebuild Machine from current IDA state (clean slate) |
+| `miasm_search_instruction_pattern` | Find consecutive mnemonic sequences inside a function |
 | `miasm_lift_to_ir` | Lift an address range to Miasm IR |
 | `miasm_lift_function` | Lift a whole function to IR + return CFG |
 | `miasm_get_ssa` | Apply SSA transformation to a function |

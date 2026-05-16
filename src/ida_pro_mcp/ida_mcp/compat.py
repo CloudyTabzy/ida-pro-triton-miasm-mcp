@@ -219,6 +219,17 @@ def inf_get_procname() -> str:
     return idaapi.get_inf_structure().procname
 
 
+def inf_is_be() -> bool:
+    """Return True iff the loaded binary is big-endian.
+
+    Matters for ARM (`armb` vs `arml`), AArch64 (`aarch64b` vs `aarch64l`),
+    MIPS (`mips32b` vs `mips32l`), and PowerPC (`ppc32b` vs `ppc32l`).
+    """
+    if IDA_GE_85:
+        return ida_ida.inf_is_be()
+    return idaapi.get_inf_structure().is_be()
+
+
 # ============================================================================
 # Function info compatibility
 # ============================================================================

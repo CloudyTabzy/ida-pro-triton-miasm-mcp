@@ -10,7 +10,7 @@ from the open IDA database — no file path or manual byte feeding required.
 import json
 import logging
 import threading
-from typing import Annotated
+from typing import Annotated, Union
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +54,15 @@ class _MiasmManager:
         self._machine: "Machine | None" = None
         self._arch_name: str = ""
         self._bitness: int = 0
+        self._is_be: bool = False
+        self._procname: str = ""
 
-    def _do_sync(self) -> str:
+    def _detect_arch_from_ida(self) -> tuple[str, int, bool, str]:
+        """Return (miasm_arch_str, bitness, is_big_endian, procname)."""
         procname = compat.inf_get_procname().lower()
+        is_be = compat.inf_is_be()
+        endian_suffix = "b" if is_be else "l"
+
         if compat.inf_is_64bit():
             bits = 64
         elif compat.inf_is_32bit():
@@ -65,24 +71,54 @@ class _MiasmManager:
             bits = 16
 
         if procname.startswith("metapc") or procname.startswith("80"):
+            # x86 is always little-endian — Miasm doesn't expose big-endian x86
             arch = f"x86_{bits}"
         elif procname.startswith("arm"):
-            arch = "aarch64l" if bits == 64 else "arml"
+            arch = f"aarch64{endian_suffix}" if bits == 64 else f"arm{endian_suffix}"
         elif procname.startswith("mips"):
-            arch = "mips32l"
+            arch = f"mips32{endian_suffix}"
         elif procname.startswith("ppc"):
-            arch = "ppc32b"
+            arch = f"ppc32{endian_suffix}"
         else:
             raise IDAError(f"Unsupported architecture for Miasm: {procname!r}")
+
+        return arch, bits, is_be, procname
+
+    def _do_sync(self, override_arch: str = "") -> str:
+        """(Re)build the Miasm Machine. Accepts an explicit arch override."""
+        if override_arch:
+            arch = override_arch
+            # Best-effort bitness detection from the override string
+            if "64" in arch:
+                bits = 64
+            elif "32" in arch:
+                bits = 32
+            else:
+                bits = 32  # safe default
+            is_be = arch.endswith("b") and not arch.startswith("x86")
+            procname = self._procname or "<override>"
+        else:
+            arch, bits, is_be, procname = self._detect_arch_from_ida()
 
         self._machine = Machine(arch)
         self._arch_name = arch
         self._bitness = bits
+        self._is_be = is_be
+        self._procname = procname
         return arch
 
     def sync(self) -> str:
         with self._lock:
             return self._do_sync()
+
+    def init(self, override_arch: str = "") -> str:
+        """Explicit (re-)initialization. Discards any cached Machine."""
+        with self._lock:
+            self._machine = None
+            self._arch_name = ""
+            self._bitness = 0
+            self._is_be = False
+            return self._do_sync(override_arch=override_arch)
 
     @property
     def machine(self) -> "Machine":
@@ -104,6 +140,20 @@ class _MiasmManager:
             if not self._bitness:
                 self._do_sync()
             return self._bitness
+
+    @property
+    def is_big_endian(self) -> bool:
+        with self._lock:
+            if not self._arch_name:
+                self._do_sync()
+            return self._is_be
+
+    @property
+    def procname(self) -> str:
+        with self._lock:
+            if not self._procname:
+                self._do_sync()
+            return self._procname
 
     def get_bytes(self, start_ea: int, end_ea: int) -> bytes:
         import ida_bytes
@@ -213,8 +263,12 @@ def miasm_status() -> str:
         f"Available     : yes",
     ]
     if _manager._arch_name:
+        endian = "big" if _manager._is_be else "little"
         lines.append(f"Architecture  : {_manager.arch_name}")
         lines.append(f"Bitness       : {_manager.bitness}")
+        lines.append(f"Endianness    : {endian}")
+        if _manager._procname:
+            lines.append(f"IDA procname  : {_manager._procname}")
     else:
         lines.append("Architecture  : (not synced — will auto-detect on first use)")
     return "\n".join(lines)
@@ -233,6 +287,124 @@ if MIASM_AVAILABLE:
         """Re-synchronise Miasm architecture with the currently loaded IDA binary."""
         arch = _manager.sync()
         return f"Miasm synchronised: architecture={arch}, bitness={_manager.bitness}"
+
+    @tool
+    @idasync
+    def miasm_init(
+        arch: Annotated[
+            str,
+            "Optional architecture override (e.g. x86_32, x86_64, arml, armb, "
+            "aarch64l, aarch64b, mips32l, mips32b, ppc32b). "
+            "Leave empty to auto-detect from the loaded IDA binary.",
+        ] = "",
+    ) -> dict:
+        """
+        Explicitly (re-)initialize the Miasm Machine.
+
+        Use this when you want a clean slate — e.g. after the IDA binary has
+        been rebased, after switching binaries, or to force a specific architecture.
+        This discards the cached Machine and rebuilds it. Architecture is
+        auto-detected from IDA unless overridden.
+
+        Endianness is derived from IDA's `inf_is_be()` for ARM / AArch64 / MIPS / PPC.
+        """
+        try:
+            arch_resolved = _manager.init(override_arch=arch)
+            return {
+                "ok": True,
+                "architecture": arch_resolved,
+                "bitness": _manager.bitness,
+                "endianness": "big" if _manager.is_big_endian else "little",
+                "procname": _manager.procname,
+                "override_used": bool(arch),
+            }
+        except IDAError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            logger.exception("miasm_init failed")
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    @tool
+    @idasync
+    def miasm_get_context_info() -> dict:
+        """
+        Return a detailed summary of the current Miasm session state.
+
+        Includes architecture, bitness, endianness, the IDA procname that the
+        Machine was built from, and the Miasm version. If the Machine has not
+        been initialized yet, the response indicates that and points at the
+        autodetected target.
+        """
+        try:
+            import miasm
+            miasm_version = getattr(miasm, "__version__", "unknown")
+        except Exception:
+            miasm_version = "unknown"
+
+        if not _manager._arch_name:
+            try:
+                preview_arch, preview_bits, preview_be, preview_proc = _manager._detect_arch_from_ida()
+                return {
+                    "ok": True,
+                    "initialized": False,
+                    "miasm_version": miasm_version,
+                    "would_auto_detect_as": {
+                        "architecture": preview_arch,
+                        "bitness": preview_bits,
+                        "endianness": "big" if preview_be else "little",
+                        "procname": preview_proc,
+                    },
+                    "note": "Machine not yet built. First Miasm call auto-syncs, or call miasm_init explicitly.",
+                }
+            except IDAError as e:
+                return {
+                    "ok": False,
+                    "initialized": False,
+                    "miasm_version": miasm_version,
+                    "error": str(e),
+                }
+
+        machine = _manager.machine
+        return {
+            "ok": True,
+            "initialized": True,
+            "miasm_version": miasm_version,
+            "architecture": _manager.arch_name,
+            "bitness": _manager.bitness,
+            "endianness": "big" if _manager.is_big_endian else "little",
+            "procname": _manager.procname,
+            "machine_name": getattr(machine, "name", _manager.arch_name),
+        }
+
+    @tool
+    @idasync
+    def miasm_reset() -> dict:
+        """
+        Reset the Miasm Machine and re-auto-detect architecture from IDA.
+
+        Equivalent to calling `miasm_init()` with no override. Useful as a
+        recovery step if the Miasm state somehow drifts from IDA's current
+        view (e.g. after a forced architecture change in IDA's processor
+        configuration).
+
+        Tool calls use a fresh `LocationDB` per request by design, so there
+        is no accumulated symbol state to clear — this resets only the
+        Machine and its associated architectural metadata.
+        """
+        try:
+            arch_resolved = _manager.init(override_arch="")
+            return {
+                "ok": True,
+                "architecture": arch_resolved,
+                "bitness": _manager.bitness,
+                "endianness": "big" if _manager.is_big_endian else "little",
+                "message": "Miasm Machine rebuilt from current IDA state.",
+            }
+        except IDAError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            logger.exception("miasm_reset failed")
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     # ========================================================================
     # IR lifting
@@ -678,3 +850,97 @@ if MIASM_AVAILABLE:
             f"Patched {len(shortest)} bytes at {hex(address)}: {shortest.hex()}\n"
             f"Instruction: {asm_string}"
         )
+
+    # ========================================================================
+    # Pattern search (instruction-level)
+    # ========================================================================
+
+    @tool
+    @idasync
+    def miasm_search_instruction_pattern(
+        address: Annotated[int, "Any address inside the function to search"],
+        mnemonics: Annotated[
+            Union[str, list[str]],
+            "Sequence of mnemonics to match consecutively (case-insensitive). "
+            "Accept either a JSON list like ['MOV','PUSH','CALL'] or a "
+            "comma-separated string 'MOV,PUSH,CALL'.",
+        ],
+        max_matches: Annotated[int, "Cap on returned match count (default 200)."] = 200,
+    ) -> dict:
+        """
+        Find every location inside the given function where the supplied
+        mnemonic sequence appears as consecutive instructions.
+
+        Useful for spotting prologues, gadget-like sequences, or signature
+        instruction patterns the AI wants to locate before deeper analysis.
+
+        Matches are reported as the address of the first instruction in the
+        sequence. Searches are case-insensitive and respect basic-block
+        boundaries (a pattern straddling a basic-block edge is reported
+        only when the consecutive Miasm-disassembled stream lists them in
+        sequence within a single block).
+        """
+        import idaapi
+
+        # Normalise the mnemonics argument
+        if isinstance(mnemonics, str):
+            seq = [m.strip().upper() for m in mnemonics.split(",") if m.strip()]
+        else:
+            seq = [str(m).strip().upper() for m in mnemonics if str(m).strip()]
+
+        if not seq:
+            return {"ok": False, "error": "Empty mnemonic sequence."}
+
+        func = idaapi.get_func(address)
+        if not func:
+            return {"ok": False, "error": f"No function found at {hex(address)}"}
+
+        data = _manager.get_bytes(func.start_ea, func.end_ea)
+        mdis, _ = _manager.get_mdis(data, func.start_ea)
+
+        try:
+            asmcfg = mdis.dis_multiblock(func.start_ea)
+        except Exception as e:
+            return {"ok": False, "error": f"Miasm disassembly failed: {e}"}
+
+        pattern_len = len(seq)
+        matches: list[dict] = []
+
+        for block in asmcfg.blocks:
+            lines = list(getattr(block, "lines", []) or [])
+            if len(lines) < pattern_len:
+                continue
+
+            for i in range(len(lines) - pattern_len + 1):
+                ok = True
+                for j in range(pattern_len):
+                    if lines[i + j].name.upper() != seq[j]:
+                        ok = False
+                        break
+                if ok:
+                    head = lines[i]
+                    tail = lines[i + pattern_len - 1]
+                    matches.append(
+                        {
+                            "address": hex(head.offset),
+                            "end_address": hex(tail.offset),
+                            "block_loc_key": str(block.loc_key),
+                            "instructions": [
+                                {"address": hex(lines[i + k].offset), "mnemonic": lines[i + k].name}
+                                for k in range(pattern_len)
+                            ],
+                        }
+                    )
+                    if len(matches) >= max_matches:
+                        break
+            if len(matches) >= max_matches:
+                break
+
+        return {
+            "ok": True,
+            "function_ea": hex(func.start_ea),
+            "pattern": seq,
+            "match_count": len(matches),
+            "truncated": len(matches) >= max_matches,
+            "matches": matches,
+        }
