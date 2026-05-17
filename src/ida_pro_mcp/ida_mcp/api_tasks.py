@@ -11,12 +11,18 @@ Typical workflow:
   3. When status == "done":
      → {"ok": true, "status": "done", "result": <tool_output>}
 
-Enhancements over the reference implementation:
-- Structured {"ok": true/false, ...} returns matching this fork's conventions
-- task_cancel: remove pending tasks or flag running tasks for cancellation
-- Task category auto-detection (triton / miasm / hybrid / core) for richer task_list
-- Trace integration: task lifecycle events are logged when tracing is enabled
-- Non-daemon worker threads with graceful atexit cleanup
+Scheduling model:
+  Tasks are queued in a priority heap (lower number = higher priority, default 5).
+  A single persistent worker thread drains the heap in priority order and executes
+  each task serially via execute_sync on the IDA main thread. This matches IDA's
+  serial main-thread model and ensures high-priority tasks run before lower-priority
+  ones already waiting in the queue.
+
+  Within the same priority level, tasks execute in FIFO (submission) order.
+
+  Future option: replace with register_timer + generator cooperative scheduling
+  for true interleaving on the main thread — see plans/phase4-ambitious-expansion.md
+  Part I (Cooperative Task Scheduler).
 
 Environment:
   IDA_MCP_TASK_TTL_SECONDS  – expiry for done/error tasks (default: 300)
@@ -24,6 +30,7 @@ Environment:
 from __future__ import annotations
 
 import atexit
+import heapq
 import os
 import threading
 import time
@@ -41,14 +48,40 @@ _TASK_TTL_SEC = int(os.environ.get("IDA_MCP_TASK_TTL_SECONDS", "300"))
 
 _backend: TaskBackend = InMemoryTaskBackend()
 
-# ── Worker tracking ───────────────────────────────────────────────────────────
+# ── Priority queue ─────────────────────────────────────────────────────────────
+# Heap entries: (priority, seq, task_id)
+# Lower priority number = runs first. seq breaks ties in FIFO submission order.
 
-_active_workers: dict[str, threading.Thread] = {}
-_workers_lock = threading.Lock()
+_task_heap: list[tuple[int, int, str]] = []
+_heap_cv = threading.Condition(threading.Lock())
+_seq_counter = 0
+_shutdown_flag = threading.Event()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def _cleanup_expired() -> None:
     _backend.delete_expired(_TASK_TTL_SEC)
+
+
+def report_task_progress(task_id: str, current: int, total: int, stage: str = "") -> None:
+    """Update a running task's progress metadata.
+
+    Call this from within a long-running tool to let task_poll callers see
+    intermediate progress without blocking the final result.
+
+    Args:
+        task_id: The task ID returned by task_submit.
+        current:  Number of items processed so far.
+        total:    Total number of items to process.
+        stage:    Optional human-readable stage name (e.g. 'analyzing_functions').
+    """
+    _backend.update_state(
+        task_id,
+        "running",
+        progress={"current": current, "total": total, "stage": stage},
+    )
 
 
 def _detect_category(tool_name: str) -> str:
@@ -62,6 +95,83 @@ def _detect_category(tool_name: str) -> str:
     return "core"
 
 
+# ── Worker ────────────────────────────────────────────────────────────────────
+
+
+def _execute_task(task_id: str) -> None:
+    """Run a single task on the worker thread."""
+    task = _backend.get_task(task_id)
+    if task is None or task.get("status") == "cancelled":
+        return
+
+    tool_name: str = task["tool"]
+    arguments: dict = task.get("arguments") or {}
+
+    # Replay captured request context so unsafe/extension gates and per-session
+    # routing behave as they would for a synchronous call.
+    caller_extensions: set[str] = set(task.get("_caller_extensions") or [])
+    caller_session_id: str | None = task.get("_caller_session_id")
+    MCP_SERVER._enabled_extensions.data = caller_extensions
+    if caller_session_id is not None:
+        MCP_SERVER._transport_session_id.data = caller_session_id
+
+    _backend.update_state(task_id, "running", started_at=time.monotonic())
+    try:
+        envelope = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+            "id": task_id,
+        }
+        resp = MCP_SERVER.registry.dispatch(envelope)
+        if resp is not None and "error" in resp:
+            err_msg = resp["error"].get("message", "unknown error")
+            _backend.update_state(
+                task_id, "error", error=err_msg, completed_at=time.monotonic()
+            )
+            return
+
+        call_result = resp.get("result") if resp else None
+        if isinstance(call_result, dict) and call_result.get("isError"):
+            msg = "tool error"
+            content = call_result.get("content") or []
+            if content and isinstance(content[0], dict):
+                msg = content[0].get("text", msg)
+            _backend.update_state(
+                task_id, "error", error=msg, completed_at=time.monotonic()
+            )
+            return
+
+        _backend.update_state(
+            task_id, "done", result=call_result, completed_at=time.monotonic()
+        )
+    except Exception as exc:
+        _backend.update_state(
+            task_id, "error", error=str(exc), completed_at=time.monotonic()
+        )
+    finally:
+        _cleanup_expired()
+
+
+def _worker_loop() -> None:
+    """Persistent worker: drain the priority heap serially until shutdown."""
+    while not _shutdown_flag.is_set():
+        with _heap_cv:
+            while not _task_heap and not _shutdown_flag.is_set():
+                _heap_cv.wait(timeout=1.0)
+            if _shutdown_flag.is_set():
+                break
+            _, _, task_id = heapq.heappop(_task_heap)
+
+        _execute_task(task_id)
+
+
+_worker_thread = threading.Thread(
+    target=_worker_loop, name="mcp-task-worker", daemon=False
+)
+_worker_thread.start()
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 
@@ -69,6 +179,7 @@ def _detect_category(tool_name: str) -> str:
 def task_submit(
     tool_name: Annotated[str, "Tool to run in the background (e.g. 'decompile', 'triton_process_function')"],
     arguments: Annotated[dict | None, "Tool arguments as a dict (same as you would pass directly)"] = None,
+    priority: Annotated[int, "Execution priority 1–9 (1=urgent, 5=normal, 9=low). Lower runs first. Default: 5."] = 5,
 ) -> dict:
     """Submit a tool call as a background task and return a task_id immediately.
 
@@ -77,16 +188,19 @@ def task_submit(
     time. After submitting, poll with task_poll(task_id) every 2-3 seconds until status
     is 'done' or 'error'.
 
-    The worker thread replays the submitter's MCP extension context so that
-    ?ext=dbg and --unsafe gated tools behave identically to synchronous calls."""
+    Tasks queue in priority order (1=urgent, 5=normal, 9=low) and execute serially.
+    Within the same priority, FIFO order is preserved. The worker replays the
+    submitter's MCP extension context so ?ext=dbg and --unsafe gated tools behave
+    identically to synchronous calls."""
+    global _seq_counter
+
     if tool_name.startswith("task_"):
         return {"ok": False, "error": "Cannot submit task management tools as async tasks"}
     if tool_name not in MCP_SERVER.tools.methods:
         return {"ok": False, "error": f"Unknown tool: {tool_name!r}"}
 
-    # Capture request-scoped thread-locals so the worker re-evaluates gates with
-    # the *submitter's* context, not the default empty state it would see in a
-    # fresh thread.
+    priority = max(1, min(9, int(priority)))
+
     caller_extensions: set[str] = set(
         getattr(MCP_SERVER._enabled_extensions, "data", set())
     )
@@ -94,7 +208,6 @@ def task_submit(
         MCP_SERVER._transport_session_id, "data", None
     )
 
-    # Collision-safe ID; retry on the astronomically unlikely duplicate.
     while True:
         task_id = uuid.uuid4().hex
         if _backend.get_task(task_id) is None:
@@ -108,6 +221,7 @@ def task_submit(
             "task_id": task_id,
             "tool": tool_name,
             "category": category,
+            "priority": priority,
             "status": "pending",
             "result": None,
             "error": None,
@@ -115,74 +229,23 @@ def task_submit(
             "started_at": None,
             "completed_at": None,
             "cancelled": False,
+            # Execution context — read back by _execute_task on the worker thread.
+            "arguments": arguments or {},
+            "_caller_extensions": list(caller_extensions),
+            "_caller_session_id": caller_session_id,
         },
     )
 
-    def _worker() -> None:
-        # Replay captured request context on the worker thread so unsafe/extension
-        # gates and per-session routing behave as they would for a synchronous call.
-        MCP_SERVER._enabled_extensions.data = caller_extensions
-        if caller_session_id is not None:
-            MCP_SERVER._transport_session_id.data = caller_session_id
-
-        # Check for cancellation before we even start
-        task = _backend.get_task(task_id)
-        if task is not None and task.get("status") == "cancelled":
-            with _workers_lock:
-                _active_workers.pop(task_id, None)
-            return
-
-        _backend.update_state(task_id, "running", started_at=time.monotonic())
-        try:
-            envelope = {
-                "jsonrpc": "2.0",
-                "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments or {}},
-                "id": task_id,
-            }
-            resp = MCP_SERVER.registry.dispatch(envelope)
-            if resp is not None and "error" in resp:
-                err_msg = resp["error"].get("message", "unknown error")
-                _backend.update_state(
-                    task_id,
-                    "error",
-                    error=err_msg,
-                    completed_at=time.monotonic(),
-                )
-                return
-
-            call_result = resp.get("result") if resp else None
-            if isinstance(call_result, dict) and call_result.get("isError"):
-                msg = "tool error"
-                content = call_result.get("content") or []
-                if content and isinstance(content[0], dict):
-                    msg = content[0].get("text", msg)
-                _backend.update_state(
-                    task_id, "error", error=msg, completed_at=time.monotonic()
-                )
-                return
-
-            _backend.update_state(
-                task_id, "done", result=call_result, completed_at=time.monotonic()
-            )
-        except Exception as exc:
-            _backend.update_state(
-                task_id, "error", error=str(exc), completed_at=time.monotonic()
-            )
-        finally:
-            with _workers_lock:
-                _active_workers.pop(task_id, None)
-            _cleanup_expired()
-
-    t = threading.Thread(target=_worker, name=f"mcp-task-{task_id[:8]}")
-    with _workers_lock:
-        _active_workers[task_id] = t
-    t.start()
+    with _heap_cv:
+        _seq_counter += 1
+        heapq.heappush(_task_heap, (priority, _seq_counter, task_id))
+        _heap_cv.notify()
 
     return {
         "ok": True,
         "task_id": task_id,
         "status": "pending",
+        "priority": priority,
         "category": category,
         "_hint": f"Poll with task_poll(task_id='{task_id}') every 2-3 seconds",
     }
@@ -208,6 +271,7 @@ def task_poll(
         "task_id": task_id,
         "tool": task["tool"],
         "category": task.get("category", "core"),
+        "priority": task.get("priority", 5),
         "status": task["status"],
         "elapsed_s": elapsed,
     }
@@ -221,6 +285,9 @@ def task_poll(
         resp["error"] = "Task was cancelled before execution started"
     else:
         resp["_hint"] = "Still running — poll again in 2-3 seconds"
+
+    if "progress" in task and task["progress"] is not None:
+        resp["progress"] = task["progress"]
 
     return resp
 
@@ -237,6 +304,7 @@ def task_list() -> dict:
                 "task_id": t["task_id"],
                 "tool": t["tool"],
                 "category": t.get("category", "core"),
+                "priority": t.get("priority", 5),
                 "status": t["status"],
                 "elapsed_s": round(time.monotonic() - t["created_at"], 1),
             }
@@ -264,7 +332,8 @@ def task_cancel(
         return {"ok": False, "error": "Failed to cancel task"}
 
     if task["status"] == "running":
-        _backend.update_state(task_id, cancel_requested=True)
+        # Preserve current status, only add the cancel_requested flag.
+        _backend.update_state(task_id, task["status"], cancel_requested=True)
         return {
             "ok": True,
             "task_id": task_id,
@@ -283,12 +352,11 @@ def task_cancel(
 
 
 def _shutdown_tasks() -> None:
-    """Wait for active worker threads to finish on process exit."""
-    with _workers_lock:
-        workers = list(_active_workers.values())
-    if workers:
-        for t in workers:
-            t.join(timeout=5.0)
+    """Signal the worker to stop and wait for it to finish on process exit."""
+    _shutdown_flag.set()
+    with _heap_cv:
+        _heap_cv.notify_all()
+    _worker_thread.join(timeout=5.0)
 
 
 atexit.register(_shutdown_tasks)

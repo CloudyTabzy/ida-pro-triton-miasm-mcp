@@ -96,7 +96,7 @@ This fork registers three equivalent CLI names so you can use whichever is clear
 
 > **Forked from** [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) — upstream core IDA tools, zeromcp transport, and idalib support are from that project.
 
-### Triton tools (36 tools)
+### Triton tools (38 tools)
 
 All tools require `pip install triton-library`. Architecture is auto-detected from the loaded binary.
 
@@ -131,6 +131,7 @@ All tools require `pip install triton-library`. Architecture is auto-detected fr
 | `triton_find_input_for_branch` | **Compound:** CFG-guided Z3 search — find inputs that drive execution to a specific address |
 | `triton_annotate_function` | Write IDA comments at branch points with path conditions |
 | `triton_highlight_tainted_instructions` | Color instructions that operate on tainted data |
+| `triton_backward_slice` | Slice backwards from a symbolic variable to find all contributing instructions |
 
 ### Miasm tools (21 tools)
 
@@ -143,22 +144,22 @@ All tools require `pip install miasm future`. Architecture is auto-detected from
 | `miasm_init` | Explicit (re-)initialization, optional architecture override |
 | `miasm_get_context_info` | Detailed session info: arch, bitness, endianness, procname |
 | `miasm_reset` | Rebuild Machine from current IDA state (clean slate) |
-| `miasm_search_instruction_pattern` | Find consecutive mnemonic sequences inside a function |
+| `miasm_search_instruction_pattern` | Find consecutive mnemonic sequences inside a function (case-insensitive) |
 | `miasm_lift_to_ir` | Lift an address range to Miasm IR |
 | `miasm_lift_function` | Lift a whole function to IR + return CFG |
 | `miasm_get_ssa` | Apply SSA transformation to a function |
 | `miasm_get_cfg_dot` | Export function CFG as Graphviz DOT |
-| `miasm_find_paths` | Find all paths between two addresses |
-| `miasm_deobfuscate_cfg` | Apply dead-code elimination to simplify CFG |
-| `miasm_simplify_block` | Symbolically execute a block, return simplified regs |
-| `miasm_emulate_symbolic` | Emulate a block with optional initial register state |
+| `miasm_get_cfg_summary` | CFG summary: block/edge count, cyclomatic complexity (E-N+2), Tarjan's SCC loop detection |
+| `miasm_find_paths` | Enumerate all execution paths between two addresses |
+| `miasm_deobfuscate_cfg` | Apply dead-code elimination (constant folding, DCE, expression simplification) |
+| `miasm_simplify_block` | Symbolically execute a block, return simplified register state |
+| `miasm_emulate_symbolic` | Emulate a block with optional concrete initial register state |
 | `miasm_get_function_side_effects` | Report which regs/memory a function reads/writes |
-| `miasm_trace_data_flow` | Trace data-flow origins of a register at an address |
-| `miasm_assemble` | Assemble an instruction, return all encodings |
-| `miasm_patch_instruction` | Assemble + patch bytes directly into the IDA database |
-| `miasm_get_cfg_summary` | CFG structural summary: blocks, edges, cyclomatic complexity, loops, topological order |
-| `miasm_solve_path_constraints` | Enumerate paths to a target and solve for concrete inputs with Z3 |
-| `miasm_annotate_data_flow` | Write IDA comments showing data-flow origins of a register |
+| `miasm_trace_data_flow` | Trace data-flow origins of a register at an address (backward slice) |
+| `miasm_annotate_data_flow` | Write IDA comments at data-flow origin instructions (`@unsafe`) |
+| `miasm_assemble` | Assemble an instruction, return all possible encodings (cross-arch) |
+| `miasm_patch_instruction` | Assemble + patch bytes directly into the IDA database (`@unsafe`) |
+| `miasm_solve_path_constraints` | Enumerate paths to a target; Z3 solving via Triton when available |
 
 ### Phase 3.5 refinements (v1.0.0)
 
@@ -171,6 +172,21 @@ All tools require `pip install miasm future`. Architecture is auto-detected from
 
 - **Async task system** — `task_submit`, `task_poll`, `task_list`, `task_cancel` for long-running operations
 - **7 workflow skills** — `binary-survey`, `stripped-binary-recovery`, `function-deep-dive`, `triton-symbolic-exec`, `miasm-ir-analysis`, `hybrid-deobfuscate`, `vuln-hunter-static`
+
+### Phase 3.8 — Reconnaissance Tools (v1.0.0)
+
+Added `api_recon.py` — 8 tools for stripped binary analysis implementing the BinaryReverseEngineering.md methodology:
+
+| Tool | Description |
+|------|-------------|
+| `get_binary_sections` | Enumerate all segments with permissions, bitness, and type |
+| `find_global_writers` | Find all instructions writing to a global (data xref `dr_W` filter) |
+| `find_vtable_candidates` | Scan for arrays of consecutive executable pointers (VTable DNA) |
+| `list_functions_in_range` | List all function entry points within an address range |
+| `find_indirect_calls` | Find all `call [reg+offset]` / `call [reg]` with vtable offset histogram |
+| `identify_vtable_call` | Trace backwards from indirect call to identify object-loading chain |
+| `analyze_cleanup_function` | Mine Release() call offsets to infer struct field layout |
+| `find_function_prologues` | Scan for common x64/x86 prologue patterns (`@unsafe` when `create=True`) |
 
 ### Hybrid tools (2 tools)
 

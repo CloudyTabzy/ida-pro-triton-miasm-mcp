@@ -56,67 +56,57 @@ mcp__ida_pro_mcp__miasm_reset()
 
 **Option F — Cross-arch assembly:** Assemble instructions and patch the database.
 
-### Option A: CFG structural analysis
+## Option A — CFG structural analysis: Understand function complexity, loops, and dead code.
 
-#### A1. Lift the function
-
-```
-mcp__ida_pro_mcp__miasm_lift_function(address="<func_addr>")
-```
-
-This returns the IRCFG (IR Control Flow Graph) as JSON blocks and edges.
-
-#### A2. Get CFG summary
+**A1. Get CFG summary**
 
 ```
 mcp__ida_pro_mcp__miasm_get_cfg_summary(address="<func_addr>")
 ```
 
-Review:
+Returns:
 - **Block count** — total basic blocks
 - **Edge count** — control flow edges
 - **Cyclomatic complexity** — `edges - nodes + 2`
-- **Loop count** — natural loops detected
-- **Topological order** — linearized block ordering
+- **Loop count** — natural loops detected via Tarjan's SCC
 
 High cyclomatic complexity (>10) suggests complex logic or obfuscation.
 
-#### A3. Get CFG DOT
+**A2. Get CFG DOT**
 
 ```
 mcp__ida_pro_mcp__miasm_get_cfg_dot(address="<func_addr>")
 ```
 
-Save the DOT output to a file and render it with Graphviz if available:
+Returns the Graphviz DOT string of the assembly CFG. Save to a file and render:
 
 ```
 Bash("dot -Tpng cfg.dot -o cfg.png")
 ```
 
-### Option B: IR lifting and SSA
+## Option B — IR lifting and SSA: View the function in Miasm's intermediate representation.
 
-#### B1. Lift to IR
+**B1. Lift to IR**
 
 ```
 mcp__ida_pro_mcp__miasm_lift_function(address="<func_addr>")
 ```
 
-Review the IR blocks. Each assembly instruction is decomposed into atomic assignments (e.g., `RAX = RDI + 4`, `Mem[RBX] = RAX`).
+Returns the IRCFG as JSON blocks and edges. Each block contains IR statements in Miasm's syntax. For a single block, use `miasm_lift_to_ir(address, end_address)`.
 
-#### B2. Apply SSA transformation
+**B2. Apply SSA transformation**
 
 ```
 mcp__ida_pro_mcp__miasm_get_ssa(address="<func_addr>")
 ```
 
-SSA form ensures each variable is assigned exactly once. This makes data-flow analysis much easier. Look for:
-- Phi functions at merge points
-- Clear def-use chains
-- Simplified expressions
+SSA form ensures each variable is assigned exactly once, enabling clear def-use chains. Look for:
+- Simplified expressions at merge points
+- Clear register assignment history
 
-### Option C: Deobfuscation
+## Option C — Deobfuscation: Remove opaque predicates, fold constants, eliminate dead code.
 
-#### C1. Get baseline CFG summary
+**C1. Get baseline**
 
 ```
 mcp__ida_pro_mcp__miasm_get_cfg_summary(address="<func_addr>")
@@ -124,124 +114,101 @@ mcp__ida_pro_mcp__miasm_get_cfg_summary(address="<func_addr>")
 
 Record the original block count and complexity.
 
-#### C2. Run deobfuscation pass
+**C2. Run deobfuscation**
 
 ```
 mcp__ida_pro_mcp__miasm_deobfuscate_cfg(address="<func_addr>")
 ```
 
-This applies:
-- Constant folding
-- Dead code elimination
-- Expression simplification
+Applies constant folding, dead code elimination, and expression simplification via Miasm's `DeadRemoval` pass.
 
-#### C3. Compare before/after
+**C3. Compare**
 
 ```
 mcp__ida_pro_mcp__miasm_get_cfg_summary(address="<func_addr>")
 ```
 
-Look for:
-- Reduced block count (dead blocks eliminated)
-- Reduced cyclomatic complexity
-- Simplified expressions
+Look for reduced block count, reduced cyclomatic complexity, and simplified expressions.
 
-#### C4. Find empty blocks
+## Option D — Data-flow tracing: Find where a register's value originates.
 
-After deobfuscation, some blocks may be empty (just a jump). These are candidates for patching (see Option F).
-
-### Option D: Data-flow tracing
-
-#### D1. Choose register and address
-
-Pick a register of interest (e.g., `RAX`) and an address where you want to know its origin.
-
-#### D2. Trace data flow
+**D1. Trace origins**
 
 ```
 mcp__ida_pro_mcp__miasm_trace_data_flow(
-    address="<addr>",
-    register="RAX",
-    max_steps=50
-)
-```
-
-This performs a backward slice to find where the register's value comes from.
-
-Review the trace:
-- Does it originate from a function argument?
-- From a memory read?
-- From a constant?
-- From arithmetic on other registers?
-
-#### D3. Annotate in IDA
-
-```
-mcp__ida_pro_mcp__miasm_annotate_data_flow(
     address="<addr>",
     register="RAX"
 )
 ```
 
-This writes IDA comments at each instruction in the data-flow path, showing the origin.
+Uses Miasm's dependency graph to perform a backward slice. Returns IR expression nodes that contribute to the register's value.
 
-### Option E: Path constraint solving
+**D2. Annotate in IDA (`@unsafe`)**
 
-#### E1. Identify target block
+> Requires `--unsafe` flag.
 
-Use `mcp__ida_pro_mcp__basic_blocks` or `mcp__ida_pro_mcp__miasm_get_cfg_summary` to identify the address of the block you want to reach.
+```
+mcp__ida_pro_mcp__miasm_annotate_data_flow(
+    address="<addr>",
+    register="RAX",
+    overwrite=False
+)
+```
 
-#### E2. Solve for path inputs
+Writes `[DF] RAX <- <origin>` comments at each data-flow origin instruction.
+
+## Option E — Path constraint solving: Find concrete inputs that reach a specific block.
+
+**E1. Find paths**
+
+```
+mcp__ida_pro_mcp__miasm_find_paths(
+    start_ea="<func_entry>",
+    target_ea="<target_block>",
+    max_paths=20
+)
+```
+
+Enumerates execution paths between two addresses within the same function.
+
+**E2. Solve for inputs**
 
 ```
 mcp__ida_pro_mcp__miasm_solve_path_constraints(
-    start_address="<func_entry>",
-    target_address="<target_block>",
-    max_paths=10
+    start_ea="<func_entry>",
+    target_ea="<target_block>",
+    symbolize_args="rdi,rsi,rdx",
+    timeout_ms=10000
 )
 ```
 
-This enumerates paths from start to target and uses Z3 to find register values that reach the target.
+Uses Miasm's CFG path finding to enumerate up to 5 paths. When Triton is available, attempts Z3 solving. Gracefully returns path addresses without Z3 model if Triton is absent.
 
-Review each path:
-- Is it feasible?
-- What register constraints are required?
-- Can the constraints be satisfied?
+## Option F — Cross-arch assembly and patching: Assemble and write instructions.
 
-### Option F: Cross-arch assembly and patching
-
-#### F1. Assemble an instruction
+**F1. Assemble**
 
 ```
-mcp__ida_pro_mcp__miasm_assemble(instruction="NOP")
-mcp__ida_pro_mcp__miasm_assemble(instruction="MOV RAX, 0x1234")
+mcp__ida_pro_mcp__miasm_assemble(
+    asm_string="MOV EAX, 1",
+    arch=""
+)
 ```
 
-Miasm supports multiple architectures (x86, x64, ARM, AArch64, MIPS). The architecture is auto-detected from IDA.
+Architecture is auto-detected from IDA. Returns all possible encodings with the shortest/longest.
 
-#### F2. Patch into IDA (unsafe)
+**F2. Patch (`@unsafe`)**
 
-> **Warning**: This requires the `--unsafe` flag.
+> Requires `--unsafe` flag.
 
 ```
 mcp__ida_pro_mcp__miasm_patch_instruction(
     address="<addr>",
-    instruction="NOP",
-    dry_run=true
+    asm_string="NOP"
 )
 ```
 
-Always use `dry_run=true` first to preview the patch without modifying the database.
-
-If the preview looks correct and the user confirms:
-
-```
-mcp__ida_pro_mcp__miasm_patch_instruction(
-    address="<addr>",
-    instruction="NOP",
-    dry_run=false
-)
-```
+Uses the shortest encoding. The change is immediately reflected in IDA's view.
 
 ### 4. Report results
 

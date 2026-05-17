@@ -9,6 +9,7 @@ All notable changes to this fork of `ida-pro-mcp` are documented in this file.
 #### Triton Symbolic Execution
 - Added `triton_annotate_function` — writes IDA comments at branch points with path conditions
 - Added `triton_highlight_tainted_instructions` — colors instructions that operate on tainted data
+- Added `triton_backward_slice` — backward data-flow slicing using `ctx.sliceExpressions()` to trace contributing instructions for a symbolic variable
 
 #### Miasm IR Analysis
 - Added `miasm_get_cfg_summary` — structural CFG metrics: block/edge counts, cyclomatic complexity, loop detection, topological ordering
@@ -55,6 +56,7 @@ All notable changes to this fork of `ida-pro-mcp` are documented in this file.
 - **Fixed Triton snapshot restore crash.** Snapshots stored `path_predicate` as a C++ AST node reference. If the original `TritonContext` was garbage-collected (e.g., by `triton_init`), restoring the snapshot would segfault. Now stores the predicate as an SMT-LIB string.
 - **Fixed `miasm_get_cfg_summary` topological sort performance.** Used `list.pop(0)` → O(n²); now uses `collections.deque`.
 - **Relaxed `miasm>=0.1.17` to `>=0.1.5`** in `pyproject.toml` — the previous constraint was unsatisfiable in standard environments.
+- **Phase 3.5 complete: 15/15 items done** (Category A/D bug fixes, API consistency improvements, test corrections). All items verified working.
 
 #### Test Fixes
 - Fixed all Triton test assertions that expected `str`/`list` returns but tools actually return `dict` (TypedDict). Every Triton test was asserting wrong return types after the Phase 3 API migration.
@@ -95,6 +97,83 @@ Added 7 modular workflow skills under `skills/`:
 #### Tests
 - Added `tests/test_task_backend.py` — 18 unit tests (CRUD, cancellation, TTL expiry, concurrency)
 
+### Phase 3.8 — Practical Enhancements
+
+**Status: 14/16 complete, 2 deferred.**
+
+#### New Tools
+- Added `apply_flirt_signature` — programmatically apply FLIRT `.sig` files to the current IDB
+- Added `load_type_library` / `list_type_libraries` — manage `.til` type libraries
+- Added `scan_signature` — expose `_sigmaker.SignatureSearcher` for pattern scanning with `?` wildcards
+- Added `get_cfg_dot` — IDA-native Graphviz CFG export without Miasm dependency
+- Added `add_xref` — create user cross-references that persist across reanalysis (`@unsafe`)
+- Added `remove_type` — strip inferred types from addresses, reverting to auto-inferred
+
+#### Reconnaissance Tools (New)
+- Added `api_recon.py` — 8 tools for stripped binary analysis implementing the BinaryReverseEngineering.md workflows:
+  - `get_binary_sections` — enumerate all segments with permissions, bitness, and type (Section I)
+  - `find_global_writers` — find all writes to a global via data xrefs filtered by `dr_W` (Sections II/III)
+  - `find_vtable_candidates` — scan sections for consecutive executable code pointers (VTable DNA search, Sections II/VI)
+  - `list_functions_in_range` — list all functions in an address range (Section X cluster analysis)
+  - `find_indirect_calls` — find all `call [reg+offset]` / `call [reg]` sites in a range with offset histogram (Sections VI/VII/VIII)
+  - `identify_vtable_call` — trace backwards from an indirect call to identify the object-loading chain (Section VIII)
+  - `analyze_cleanup_function` — mine Release() call offsets to infer struct field layout (Section IX)
+  - `find_function_prologues` — scan for common x64/x86 prologue patterns and optionally materialize functions (`@unsafe`, Sections VI/XI)
+
+#### Debugger Enhancements
+- Extended `dbg_add_bp` with hardware breakpoint support (`bpt_type`, `size` parameters)
+- Added `dbg_attach_pid` — attach to a running process by PID (`@ext("dbg") @unsafe`)
+
+#### Batch Patch Verification
+- Extended `patch_asm` with `expected_bytes` pre-flight verification — mismatch returns `verified: false` without writing
+
+#### Triton Snapshot — Instruction Trace Replay
+- `triton_snapshot_save` now stores the executed instruction address trace
+- `triton_snapshot_restore` replays the trace against a fresh context to rebuild the path predicate
+- Added `triton_replay_instructions` — manually replay a custom instruction sequence for AI agents needing fine-grained trace control
+- Trace capped at 10,000 instructions per session using `collections.deque(maxlen=10_000)` with automatic eviction
+
+#### Task Infrastructure
+- Added `report_task_progress(task_id, current, total, stage)` public helper
+- `task_poll` now surfaces `progress: {current, total, stage}` when available
+
+#### Verified / No Changes Needed
+- `triton://session/constraints` resource — already correctly implemented in `api_resources.py`
+- `miasm_get_cfg_summary` — confirmed O(n) with `collections.deque`
+
+---
+
+## [Unreleased] — Phase 3.9 — Miasm Consolidation
+
+**Status: 8/8 issues fixed.**
+
+#### Critical Bug Fixes
+- **Fixed `miasm_search_instruction_pattern` availability guard in docstring.** The `if not MIASM_AVAILABLE:` check was indented inside the function's docstring, making it dead code for months. Moved the check to be the first line of the actual function body.
+- **Fixed `miasm_get_cfg_dot` / `miasm_find_paths` duplicate definition.** When `miasm_get_cfg_summary` was inserted before `miasm_get_cfg_dot`, a line-shift caused the `miasm_find_paths` function definition to accidentally overwrite `miasm_get_cfg_dot`'s signature. Restored `miasm_get_cfg_dot` with its correct `address` parameter and docstring.
+
+#### Robustness Fixes
+- **`_MiasmManager.get_bytes` now returns `bytes | None`** instead of raising `IDAError`. All 11 call sites updated to check for `None` and return structured error dicts.
+- **`_trace_data_flow_internal` now always returns `dict`** instead of `dict | list[str]`. `miasm_trace_data_flow` no longer needs `isinstance` checks.
+- **Added null checks for `get_bytes` at all 11 call sites.** Every tool now checks for `None` and returns a structured error dict instead of crashing.
+
+#### New Tools
+- **`miasm_get_cfg_summary`** — block count, edge count, cyclomatic complexity (E - N + 2), and loop detection via Tarjan's SCC.
+- **`miasm_annotate_data_flow`** — traces data-flow origins and writes IDA comments at each origin instruction (`@unsafe`). Uses `func.addresses` iteration + `ida_ua.decode_insn` + `idaapi.generate_disasm_line` for reliable IDA-side annotation.
+- **`miasm_solve_path_constraints`** — Miasm CFG path enumeration. Falls back gracefully when Triton is absent (returns path addresses without Z3 model).
+
+#### Tool Inventory (post-Phase 3.9)
+| Tool | Status |
+|------|--------|
+| `miasm_status`, `miasm_sync`, `miasm_init`, `miasm_get_context_info`, `miasm_reset` | ✅ Working |
+| `miasm_lift_to_ir`, `miasm_lift_function`, `miasm_get_ssa` | ✅ Working |
+| `miasm_get_cfg_dot`, `miasm_get_cfg_summary` | ✅ Working (new: cfg_summary) |
+| `miasm_find_paths`, `miasm_deobfuscate_cfg`, `miasm_simplify_block` | ✅ Working |
+| `miasm_emulate_symbolic`, `miasm_get_function_side_effects`, `miasm_trace_data_flow` | ✅ Working |
+| `miasm_annotate_data_flow` | ✅ New — uses `func.addresses` + `ida_ua.decode_insn` + `idaapi.generate_disasm_line` for IDA-native annotation |
+| `miasm_assemble`, `miasm_patch_instruction` | ✅ Working |
+| `miasm_search_instruction_pattern` | ✅ Fixed (was dead code guard in docstring) |
+| `miasm_solve_path_constraints` | ✅ New |
+
 ---
 
 ## [0.2.0] — 2026-05-16
@@ -125,11 +204,11 @@ Added 7 modular workflow skills under `skills/`:
 - Added `ida-triton-miasm-mcp` script alias
 - Wired optional imports in `ida_mcp/__init__.py`
 
-#### Triton Symbolic Execution (32 tools)
+#### Triton Symbolic Execution (37 tools)
 - Context lifecycle: `triton_status`, `triton_init`, `triton_reset`, `triton_get_context_info`
 - Symbolization: `triton_symbolize_register`, `triton_symbolize_memory`, `triton_batch_symbolize_registers`
 - Concrete I/O: `triton_set_concrete_register_value`, `triton_get_concrete_register_value`, `triton_set_concrete_memory_value`, `triton_get_concrete_memory_value`
-- Instruction processing: `triton_process_instruction`, `triton_process_function`
+- Instruction processing: `triton_process_instruction`, `triton_process_function`, `triton_replay_instructions`
 - Taint analysis: `triton_taint_register`, `triton_untaint_register`, `triton_taint_memory`, `triton_untaint_memory`, `triton_is_register_tainted`, `triton_is_memory_tainted`, `triton_get_taint_summary`, `triton_batch_taint_registers`
 - SMT solving: `triton_solve_path_constraints`, `triton_get_ast_expression`, `triton_simplify_expression`, `triton_lift_to_smt`
 - Snapshots: `triton_snapshot_save`, `triton_snapshot_restore`, `triton_snapshot_list`, `triton_snapshot_delete`

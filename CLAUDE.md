@@ -22,12 +22,25 @@ Core API modules (upstream):
 - `api_debug.py`: debugger control, unsafe / low priority for tests
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://` MCP resources
+- `api_recon.py`: reconnaissance tools for stripped binaries — sections, global writers, VTable candidates, indirect calls, cleanup/method resolution, function prologue detection
 
 Optional analysis engine modules (this fork):
-- `api_triton.py`: Triton symbolic execution — 36 tools covering context lifecycle, symbolization, concrete values, instruction processing, taint analysis, SMT solving, snapshots, IDA annotation, and taint highlighting. Requires `pip install triton-library`.
+- `api_triton.py`: Triton symbolic execution — 38 tools covering context lifecycle, symbolization, concrete values, instruction processing, taint analysis, SMT solving, snapshots, instruction trace replay, IDA annotation, taint highlighting, and backward slicing. Requires `pip install triton-library`.
 - `api_miasm.py`: Miasm IR analysis — 21 tools covering IR lifting, SSA, CFG analysis, dead-code elimination, symbolic emulation, data-flow tracing, cross-arch assembly/patching, CFG summary, path constraint solving, and IDA annotation. Requires `pip install miasm future`.
 - `api_composite.py`: Hybrid cross-engine workflows — `hybrid_analyze_function` (Miasm deobfuscation + Triton symbolic execution) and `hybrid_deobfuscate_and_patch` (dead-code detection + safe patching).
 - `api_tasks.py`: Async task queue — `task_submit`, `task_poll`, `task_list`, `task_cancel`. Submit heavy tools (decompile, Triton/Miasm analysis, callgraph) as background tasks to avoid MCP client timeouts. Worker threads replay the submitter's extension/unsafe context.
+
+**Instruction trace (Triton):** Each session maintains a `deque` of executed instruction addresses (max 10,000). On `triton_snapshot_save`, the trace is stored in the snapshot. On `triton_snapshot_restore`, it is replayed to rebuild the path predicate. The new `triton_replay_instructions` tool gives AI agents manual control over custom instruction sequences.
+
+**Server name:** The MCP server identifies itself to clients as `ida-pro-triton-miasm-mcp`. The canonical name is defined once in `ida_mcp/rpc.py` as `MCP_SERVER_NAME` and imported by `server.py`, `idalib_supervisor.py`, and `installer.py` — no duplication.
+
+**Return-type design principle:**
+Every tool in this fork returns a **structured `dict` / `TypedDict`**, never raw strings or untyped lists. This is intentional:
+- AI agents parse fields programmatically without regex.
+- Consistent error shape: `{"ok": false, "error": "..."}` across all modules.
+- Downstream tools can chain outputs directly.
+
+If you find a tool that returns a plain string where a dict is expected, that's a bug — fix it.
 
 Workflow skills (`skills/`):
 - `binary-survey`: Initial reconnaissance — metadata, segments, imports, strings, function triage

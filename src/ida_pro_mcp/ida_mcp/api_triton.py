@@ -8,8 +8,10 @@ from the open IDA database — no file path or manual byte feeding required.
 """
 
 import logging
+import sys
 import time
 import threading
+import collections
 from collections import OrderedDict
 from typing import Annotated, NotRequired, TypedDict
 
@@ -18,6 +20,13 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Optional import guard
 # ============================================================================
+
+# Python 313 path fallback: if running under a different Python (e.g. the
+# hermes-agent venv), prepend Python 313's site-packages so triton-library
+# can be found even when IDA loads the plugin from its own embedded Python.
+_PY313_SITE_PACKAGES = r"C:\Users\User\AppData\Local\Programs\Python\Python313\Lib\site-packages"
+if _PY313_SITE_PACKAGES not in sys.path:
+    sys.path.insert(0, _PY313_SITE_PACKAGES)
 
 try:
     import triton as _triton_lib
@@ -59,6 +68,25 @@ _contexts_lock = threading.Lock()
 _snapshots: "dict[int, dict]" = {}
 _next_snapshot_id = 0
 _snapshots_lock = threading.Lock()
+
+# Instruction trace for snapshot replay.
+# Each entry maps session key -> deque of executed instruction addresses (ea int).
+# Max trace length per session prevents unbounded memory growth.
+_MAX_EXEC_TRACE_LEN = 10000
+_exec_traces: "dict[str, collections.deque[int]]" = {}
+_exec_traces_lock = threading.Lock()
+
+
+def _get_trace() -> "collections.deque[int]":
+    with _exec_traces_lock:
+        if _CTX_KEY not in _exec_traces:
+            _exec_traces[_CTX_KEY] = collections.deque(maxlen=_MAX_EXEC_TRACE_LEN)
+        return _exec_traces[_CTX_KEY]
+
+
+def _clear_trace() -> None:
+    with _exec_traces_lock:
+        _exec_traces.pop(_CTX_KEY, None)
 
 
 def _get_ctx(key: str = _CTX_KEY) -> "TritonContext":
@@ -260,6 +288,7 @@ class SnapshotResult(TypedDict, total=False):
     label: str
     timestamp: float
     sym_var_count: int
+    instruction_trace_count: NotRequired[int]
     error: str
 
 
@@ -358,6 +387,7 @@ def triton_init(
 
         ctx = _build_ctx(arch)
         _set_ctx(_CTX_KEY, ctx)
+        _clear_trace()
 
         version = str(getattr(_triton_lib, "VERSION", "installed"))
         arch_str = _arch_to_str(arch)
@@ -379,6 +409,8 @@ def triton_reset() -> TritonResetResult:
     The architecture is preserved. Equivalent to starting a new analysis
     on the same binary without reinitialising the context.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         ctx.reset()
@@ -398,6 +430,8 @@ def triton_get_context_info() -> dict:
     Includes architecture, enabled modes, symbolic variable count,
     path constraint count, and taint state.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         sym_vars = ctx.getSymbolicVariables()
@@ -452,6 +486,8 @@ def triton_symbolize_register(
 
     Returns the symbolic variable ID that can later be used in constraint queries.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "register": register, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         reg = ctx.getRegister(register.lower())
@@ -477,6 +513,8 @@ def triton_symbolize_memory(
     alias: Annotated[str, "Optional alias / label for this symbolic variable."] = "",
 ) -> dict:
     """Mark a memory range as symbolic (attacker-controlled / unknown)."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         addr = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address, 0)
@@ -504,6 +542,8 @@ def triton_batch_symbolize_registers(
     ],
 ) -> list[dict]:
     """Symbolise multiple registers in a single call."""
+    if not TRITON_AVAILABLE:
+        return [{"ok": False, "error": "triton-library not installed"}]
     if isinstance(registers, str):
         regs = [r.strip() for r in registers.split(",") if r.strip()]
     else:
@@ -540,6 +580,8 @@ def triton_set_concrete_register_value(
     value: Annotated[str, "Value as decimal integer or 0x-prefixed hex string."],
 ) -> dict:
     """Set a concrete (known) value for a register before processing instructions."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         int_val = int(value, 16) if isinstance(value, str) and value.startswith("0x") else int(value, 0)
@@ -558,6 +600,8 @@ def triton_get_concrete_register_value(
     register: Annotated[str, "Register name (e.g. rdi, eax)."],
 ) -> dict:
     """Read back the current concrete value of a register from the Triton context."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         reg = ctx.getRegister(register.lower())
@@ -580,6 +624,8 @@ def triton_set_concrete_memory_value(
     This does NOT modify the IDA database — it only affects the Triton
     context's view of memory for symbolic execution purposes.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         addr = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address, 0)
@@ -599,6 +645,8 @@ def triton_get_concrete_memory_value(
     size: Annotated[int, "Number of bytes to read."] = 8,
 ) -> dict:
     """Read concrete bytes from the Triton context's memory model."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         addr = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address, 0)
@@ -629,6 +677,8 @@ def triton_process_instruction(
     Fetches bytes directly from IDA, feeds them to Triton, and returns
     a summary of what changed (new symbolic expressions, path constraints added).
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     import idaapi
     import idc
     import ida_lines
@@ -661,6 +711,7 @@ def triton_process_instruction(
 
         sym_after = len(ctx.getSymbolicExpressions())
         pc_after = len(ctx.getPathConstraints())
+        _get_trace().append(ea)
 
         disasm_raw = ida_lines.generate_disasm_line(ea, 0)
         disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
@@ -698,6 +749,8 @@ def triton_process_function(
 
     Use triton_snapshot_save before calling if you want to restore state afterwards.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     import idaapi
     import idc
     import ida_funcs
@@ -739,6 +792,7 @@ def triton_process_function(
             insn.setAddress(curr)
             insn.setOpcode(raw)
             ctx.processing(insn)
+            _get_trace().append(curr)
 
             disasm_raw = ida_lines.generate_disasm_line(curr, 0)
             disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
@@ -787,6 +841,8 @@ def triton_get_symbolic_variables() -> dict:
     Each entry shows the variable's ID, name, alias, bitsize, and origin
     (the register name or memory address it was created from).
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         from triton import SYMBOLIC
@@ -833,6 +889,8 @@ def triton_get_symbolic_expressions(
     Symbolic expressions are the SSA nodes produced as each instruction
     is processed. Use limit=0 to retrieve all (can be very large).
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         exprs = ctx.getSymbolicExpressions()
@@ -871,6 +929,8 @@ def triton_get_path_constraints() -> dict:
     field contains the taken/not-taken predicates for that branch, which can
     be negated and fed to triton_solve_path_constraints for reachability queries.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         pcs = ctx.getPathConstraints()
@@ -909,6 +969,8 @@ def triton_taint_register(
     register: Annotated[str, "Register name (e.g. rdi, rsi, eax)."],
 ) -> TaintResult:
     """Mark a register as tainted (attacker-influenced data)."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         reg = ctx.getRegister(register.lower())
@@ -926,6 +988,8 @@ def triton_untaint_register(
     register: Annotated[str, "Register name (e.g. rdi, rsi, eax)."],
 ) -> TaintResult:
     """Remove taint from a register."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         reg = ctx.getRegister(register.lower())
@@ -944,6 +1008,8 @@ def triton_taint_memory(
     size: Annotated[int, "Number of bytes to taint."] = 1,
 ) -> TaintResult:
     """Mark a memory range as tainted."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         addr = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address, 0)
@@ -963,6 +1029,8 @@ def triton_untaint_memory(
     size: Annotated[int, "Number of bytes to untaint."] = 1,
 ) -> TaintResult:
     """Remove taint from a memory range."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         addr = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address, 0)
@@ -984,6 +1052,8 @@ def triton_batch_taint_registers(
     ],
 ) -> list[TaintResult]:
     """Taint multiple registers in one call."""
+    if not TRITON_AVAILABLE:
+        return [{"ok": False, "error": "triton-library not installed"}]
     if isinstance(registers, str):
         regs = [r.strip() for r in registers.split(",") if r.strip()]
     else:
@@ -1009,6 +1079,8 @@ def triton_is_register_tainted(
     register: Annotated[str, "Register name."],
 ) -> dict:
     """Check whether a register is currently tainted."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         reg = ctx.getRegister(register.lower())
@@ -1026,6 +1098,8 @@ def triton_is_memory_tainted(
     size: Annotated[int, "Number of bytes to check."] = 1,
 ) -> dict:
     """Check whether a memory range is currently tainted."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         addr = int(address, 16) if isinstance(address, str) and address.startswith("0x") else int(address, 0)
@@ -1041,6 +1115,8 @@ def triton_is_memory_tainted(
 @idasync
 def triton_get_taint_summary() -> TaintSummaryResult:
     """Return all currently tainted registers and memory addresses."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         tainted_regs = [r.getName() for r in ctx.getTaintedRegisters()]
@@ -1084,6 +1160,8 @@ def triton_solve_path_constraints(
       4. triton_solve_path_constraints()      # find input reaching observed path
       5. triton_solve_path_constraints(negate_last=true)  # find input for other branch
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         ast = ctx.getAstContext()
@@ -1131,6 +1209,8 @@ def triton_get_ast_expression(
     Useful for inspecting what a register or memory cell evaluates to in
     terms of the symbolic inputs.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         ast = ctx.getAstContext()
@@ -1173,6 +1253,8 @@ def triton_simplify_expression(
 
     Returns the original and simplified AST strings.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         expr = ctx.getSymbolicExpression(symbolic_expression_id)
@@ -1206,6 +1288,8 @@ def triton_lift_to_smt(
     The output can be pasted into Z3 or any SMT-LIB 2 compliant solver
     for external analysis.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         ctx = _get_ctx()
         expr = ctx.getSymbolicExpression(symbolic_expression_id)
@@ -1239,6 +1323,8 @@ def triton_snapshot_save(
     Captures symbolic variables, path predicate, taint state, and concrete
     register values. Restore with triton_snapshot_restore.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     global _next_snapshot_id
 
     try:
@@ -1275,6 +1361,9 @@ def triton_snapshot_save(
         tainted_reg_ids = [r.getId() for r in ctx.getTaintedRegisters()]
         tainted_mem_addrs = list(ctx.getTaintedMemory())
 
+        # Instruction trace for predicate reconstruction on restore
+        trace_list = list(_get_trace())
+
         with _snapshots_lock:
             snap_id = _next_snapshot_id
             _next_snapshot_id += 1
@@ -1288,6 +1377,7 @@ def triton_snapshot_save(
                 "tainted_reg_ids": tainted_reg_ids,
                 "tainted_mem_addrs": tainted_mem_addrs,
                 "path_predicate_smt": path_predicate_smt,
+                "instruction_trace": trace_list,
             }
 
         return {
@@ -1296,6 +1386,7 @@ def triton_snapshot_save(
             "label": label or f"snapshot_{snap_id}",
             "timestamp": _snapshots[snap_id]["timestamp"],
             "sym_var_count": len(sym_vars_data),
+            "instruction_trace_count": len(trace_list),
         }
 
     except IDAError as e:
@@ -1309,23 +1400,29 @@ def triton_snapshot_save(
 @idasync
 def triton_snapshot_restore(
     snapshot_id: Annotated[int, "Snapshot ID returned by triton_snapshot_save."],
+    replay_trace: Annotated[
+        bool,
+        "Replay the stored instruction trace to rebuild path predicate "
+        "(default True). Set False to skip replay and only restore register/symbol/taint state.",
+    ] = True,
 ) -> dict:
     """Restore Triton context to a previously saved snapshot.
 
     Re-creates the context with the same architecture, re-symbolizes the same
-    registers/memory, restores taint state, and re-pushes the path predicate.
-    All symbolic expressions generated after the snapshot are discarded.
+    registers/memory, restores taint state, and replays the stored instruction
+    trace to rebuild the path predicate. All symbolic expressions generated
+    after the snapshot are discarded.
     """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     try:
         with _snapshots_lock:
             snap = _snapshots.get(snapshot_id)
         if snap is None:
             return {"ok": False, "error": f"Snapshot {snapshot_id} not found"}
 
-        # Build a fresh context with same arch and modes
         new_ctx = _build_ctx(snap["arch"])
 
-        # Restore concrete register values
         for reg_id, (reg_name, val) in snap["registers"].items():
             try:
                 reg = new_ctx.getRegister(reg_name)
@@ -1333,7 +1430,6 @@ def triton_snapshot_restore(
             except Exception:
                 pass
 
-        # Re-symbolize same registers/memory with same aliases
         for sv_info in snap["sym_vars"]:
             try:
                 if sv_info["type_is_register"]:
@@ -1345,7 +1441,6 @@ def triton_snapshot_restore(
             except Exception:
                 pass
 
-        # Restore taint
         for reg_id in snap["tainted_reg_ids"]:
             try:
                 new_ctx.taintRegister(new_ctx.getRegister(reg_id))
@@ -1354,18 +1449,33 @@ def triton_snapshot_restore(
         for addr in snap["tainted_mem_addrs"]:
             new_ctx.taintMemory(addr)
 
-        # Re-push saved path predicate from SMT-LIB string
-        smt_str = snap.get("path_predicate_smt", "")
-        if smt_str:
+        # Replay stored instruction trace to rebuild path predicate naturally.
+        # Because concrete register values and symbolic variables were restored
+        # above before replay, re-executing the same instructions in the same
+        # order produces the identical path constraints.
+        replay_count = 0
+        trace_ea_list = snap.get("instruction_trace", [])
+        if replay_trace and trace_ea_list:
             try:
-                # Triton does not expose a direct SMT parse-to-AST API in Python.
-                # We rebuild the predicate by re-processing the same instructions
-                # that generated the original constraints. The concrete register
-                # values and symbolic variables have already been restored above,
-                # so re-execution will produce the same path constraints.
-                # NOTE: this is a best-effort reconstruction. Complex predicates
-                # with external symbolic memory may differ slightly.
-                pass  # Intentionally no-op — predicate rebuilt by caller via re-execution
+                import idaapi
+                import idc
+                _clear_trace()
+                trace_deque = _get_trace()
+                for ea in trace_ea_list:
+                    insn_ida = idaapi.insn_t()
+                    length = idaapi.decode_insn(insn_ida, ea)
+                    if length == 0:
+                        continue
+                    raw = idc.get_bytes(ea, length)
+                    if not raw:
+                        continue
+                    new_ctx.setConcreteMemoryAreaValue(ea, raw)
+                    insn = TritonInstruction()
+                    insn.setAddress(ea)
+                    insn.setOpcode(raw)
+                    new_ctx.processing(insn)
+                    trace_deque.append(ea)
+                    replay_count += 1
             except Exception:
                 pass
 
@@ -1375,6 +1485,8 @@ def triton_snapshot_restore(
             "snapshot_id": snapshot_id,
             "label": snap["label"],
             "sym_var_count": len(snap["sym_vars"]),
+            "replay_count": replay_count,
+            "trace_length": len(trace_ea_list),
         }
 
     except Exception as e:
@@ -1384,8 +1496,82 @@ def triton_snapshot_restore(
 
 @tool
 @idasync
+def triton_replay_instructions(
+    addresses: Annotated[
+        list[str],
+        "List of instruction addresses (hex or symbol names) to replay in order. "
+        "Each instruction is processed through the current Triton context, accumulating "
+        "path constraints. Useful for rebuilding a path predicate after snapshot restore "
+        "or for manually reconstructing constraint state.",
+    ],
+) -> dict:
+    """Replay a list of instruction addresses through the current Triton context.
+
+    Fetches bytes from IDA for each address and processes them through Triton,
+    naturally accumulating path constraints in the same way as processing instructions
+    individually. The current context must already be initialised (call triton_init first).
+
+    This is a standalone tool for AI agents who want to:
+    - Rebuild path constraints after triton_snapshot_restore (trace is stored in snapshot)
+    - Replay a custom instruction sequence against the current context
+    - Manually reconstruct symbolic state from a known instruction trace
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
+    try:
+        ctx = _get_ctx()
+        from .utils import parse_address
+
+        trace_deque = _get_trace()
+        processed = []
+        pc_before = len(ctx.getPathConstraints())
+
+        for addr_str in addresses:
+            ea = parse_address(addr_str)
+            import idaapi
+            import idc
+
+            insn_ida = idaapi.insn_t()
+            length = idaapi.decode_insn(insn_ida, ea)
+            if length == 0:
+                continue
+            raw = idc.get_bytes(ea, length)
+            if not raw:
+                continue
+
+            ctx.setConcreteMemoryAreaValue(ea, raw)
+            insn = TritonInstruction()
+            insn.setAddress(ea)
+            insn.setOpcode(raw)
+            ctx.processing(insn)
+            trace_deque.append(ea)
+
+            processed.append({
+                "address": hex(ea),
+                "size": length,
+                "is_branch": insn.isBranch(),
+            })
+
+        pc_after = len(ctx.getPathConstraints())
+        return {
+            "ok": True,
+            "instructions_replayed": len(processed),
+            "path_constraints_added": pc_after - pc_before,
+            "processed": processed,
+        }
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_replay_instructions failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
 def triton_snapshot_list() -> dict:
     """List all saved snapshots with their IDs, labels, and state summaries."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     with _snapshots_lock:
         snaps = list(_snapshots.values())
 
@@ -1408,6 +1594,8 @@ def triton_snapshot_delete(
     snapshot_id: Annotated[int, "Snapshot ID to delete."],
 ) -> dict:
     """Delete a saved snapshot to free memory."""
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed"}
     with _snapshots_lock:
         if snapshot_id not in _snapshots:
             return {"ok": False, "error": f"Snapshot {snapshot_id} not found"}
@@ -1479,6 +1667,7 @@ def _process_function_instructions_linear(
         insn.setAddress(curr)
         insn.setOpcode(raw)
         ctx.processing(insn)
+        _get_trace().append(curr)
 
         disasm_raw = ida_lines.generate_disasm_line(curr, 0)
         disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
@@ -1841,6 +2030,7 @@ def triton_find_input_for_branch(
                 insn.setAddress(curr)
                 insn.setOpcode(raw)
                 ctx.processing(insn)
+                _get_trace().append(curr)
 
                 disasm_raw = ida_lines.generate_disasm_line(curr, 0)
                 disasm = ida_lines.tag_remove(disasm_raw) if disasm_raw else ""
@@ -2062,6 +2252,7 @@ def triton_highlight_tainted_instructions(
             insn.setAddress(curr)
             insn.setOpcode(raw)
             ctx.processing(insn)
+            _get_trace().append(curr)
 
             if insn.isTainted():
                 idc.set_color(curr, idc.CIC_ITEM, color_val)
@@ -2082,4 +2273,68 @@ def triton_highlight_tainted_instructions(
         return {"ok": False, "error": e.message}
     except Exception as e:
         logger.exception("triton_highlight_tainted_instructions failed")
+        return {"ok": False, "error": str(e)}
+
+
+@tool
+@idasync
+def triton_backward_slice(
+    sym_var_id_or_name: Annotated[
+        str,
+        "Symbolic variable ID (integer) or alias name to slice backwards from.",
+    ],
+) -> dict:
+    """Perform backward slicing from a symbolic variable to find all contributing instructions.
+
+    Uses Triton's `sliceExpressions()` to reconstruct the data-flow graph
+    for a given symbolic variable — showing which prior instructions and
+    symbolic expressions contributed to its current value.
+
+    This is useful for:
+    - Understanding data origin in a symbolic execution trace
+    - Identifying which instructions a tainted value flows through
+    - Finding the full dependency chain of a register or memory cell
+
+    Requires a Triton context that has already processed instructions
+    (via triton_process_function or triton_analyze_function).
+    """
+    if not TRITON_AVAILABLE:
+        return {"ok": False, "error": "triton-library not installed. Run: ida-pro-mcp --install-deps triton"}
+    try:
+        ctx = _get_ctx()
+
+        try:
+            sv = ctx.getSymbolicVariable(int(sym_var_id_or_name))
+        except (ValueError, TypeError):
+            sv = ctx.getSymbolicVariable(sym_var_id_or_name)
+
+        if sv is None:
+            return {"ok": False, "error": f"Symbolic variable not found: {sym_var_id_or_name!r}"}
+
+        slice_result = ctx.sliceExpressions(sv)
+
+        entries = []
+        for expr_id, expr in slice_result.items():
+            entries.append({
+                "expr_id": expr_id,
+                "kind": "memory" if expr.isMemory() else ("register" if expr.isRegister() else "volatile"),
+                "is_symbolized": expr.isSymbolized(),
+                "is_tainted": expr.isTainted(),
+                "disasm": expr.getDisassembly(),
+                "ast": str(expr.getAst()),
+            })
+
+        return {
+            "ok": True,
+            "target_sym_var_id": sv.getId(),
+            "target_sym_var_name": sv.getName(),
+            "target_alias": sv.getAlias(),
+            "slice_expr_count": len(entries),
+            "slice": entries,
+        }
+
+    except IDAError as e:
+        return {"ok": False, "error": e.message}
+    except Exception as e:
+        logger.exception("triton_backward_slice failed")
         return {"ok": False, "error": str(e)}
