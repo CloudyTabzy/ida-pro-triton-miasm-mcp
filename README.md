@@ -130,6 +130,29 @@ flowchart TB
 
 ---
 
+## 🎓 Specialized AI Skills
+
+Beyond the raw tool surface, the project ships **12+ focused workflow skills** under `skills/`. Each skill is a mini-playbook that teaches an AI agent how to tackle a specific reverse-engineering scenario — with exact tool calls, decision branches, and report templates.
+
+| Skill | What it does |
+|-------|-------------|
+| `binary-survey` | One-call triage when you first open a binary — metadata, imports, exports, strings, function triage, anti-debug pattern scan |
+| `function-deep-dive` | Systematic single-function analysis — decompile, disasm, CFG, stack frame, xrefs, rename, type, comment |
+| `stripped-binary-recovery` | Rebuild semantics from `FUN_xxxx` binaries — FLIRT, prologue scanning, VTables, string xref triage, call-graph hub analysis |
+| `triton-symbolic-exec` | Symbolic execution workflows — one-shot analysis, instruction-by-instruction control, taint tracking, branch solving, snapshots |
+| `miasm-ir-analysis` | IR lifting, SSA, CFG metrics, dead-code elimination, data-flow tracing, cross-arch assembly |
+| `hybrid-deobfuscate` | Cross-engine deobfuscation — Miasm simplify → Triton verify → optional patching |
+| `construct-format-parsing` | PE/ELF/protocol parsing, C-syntax structs, magic-byte identification, heuristic guessing |
+| `crypto-constant-hunter` | Hunt AES S-boxes, SHA init vectors, MD5 constants, ChaCha20 sigma words, Base64 alphabets |
+| `debugger-trace` | Live debugger control — breakpoints, register/memory inspection, anti-debug bypass, dynamic unpacking |
+| `api-hook-analysis` | Detect IAT hijacking, inline hooks, VTable hijacking, detours, COM hooking |
+| `vuln-hunter-static` | Static vulnerability hunting — buffer overflows, format strings, command injection, integer overflows |
+| `idapython` | IDAPython scripting reference — module router, common API idioms, ctree visitors |
+
+Skills are automatically discovered by MCP clients that support the skill directory pattern. Point your client at the `skills/` folder and the AI gains instant expertise for each analysis domain.
+
+---
+
 ## 🛠️ Tool Inventory
 
 ### 🧠 Triton — Symbolic Execution (`triton_*`)
@@ -480,6 +503,36 @@ uv run coverage run -m ida_pro_mcp.test tests/crackme03.elf -q
 uv run coverage run --append -m ida_pro_mcp.test tests/typed_fixture.elf -q
 uv run coverage report --show-missing
 ```
+
+---
+
+## 🔮 Roadmap
+
+The project is actively evolving. Here's what's on the horizon:
+
+### Phase 4 — Surgical Analysis & Workflow Automation *(in progress)*
+
+**Smarter recovery from stripped binaries.** After FLIRT signatures run, the plugin will auto-suggest names for the remaining unnamed functions by scoring prologue matches, cross-reference patterns, and structural similarity — turning hours of manual triage into a ranked candidate list.
+
+**Type propagation chains.** Starting from a single `malloc` call, the engine will trace forward through field writes and pointer assignments to auto-infer complete struct layouts — no more guessing what lives at offset `0x18`.
+
+**Batch deobfuscation.** Instead of cleaning one function at a time, point the tool at an entire segment (`.text`, `.itext`) and let it automatically identify obfuscated functions, run iterative Miasm simplification, and NOP out dead code — converging on clean assembly without manual intervention.
+
+**Multi-hop xref archaeology.** Trace data flow across function boundaries, through call chains, and into global variables. Follow a tainted register from `main` all the way to the `recv` call that populates it — hop by hop, with full edge classification.
+
+### Phase 5 — Scientific Computing & Advanced Binary Intelligence *(planned)*
+
+**Entropy heatmaps.** Visualize which regions of a binary are encrypted, compressed, or plaintext — computed numerically across the entire image, not just the sections IDA knows about.
+
+**Graph-theoretic RE.** Run PageRank on the call graph to find the "most important" functions. Use community detection to auto-partition a malware binary into its crypto, networking, and anti-analysis modules. Find critical bridges whose removal would disconnect entire subsystems.
+
+**Signal processing for crypto detection.** Apply FFT and spectral analysis to binary data to detect periodic patterns — AES S-box tables, repeated XOR keys, and encoded C2 domains reveal themselves as frequency spikes.
+
+**YARA signature scanning.** Built-in rules for malware families (Cobalt Strike, Metasploit, Mimikatz), crypto constants, and packer stubs — scan the entire binary in milliseconds without writing a single rule.
+
+**Binary format surgery.** Add sections, patch imports, rebuild headers, and strip debug metadata — all through a unified cross-format API. Inject a TLS callback for testing, or remove a rich header to neutralize build-environment leaks.
+
+**Exploit primitives.** Generate cross-architecture shellcode, build cyclic De Bruijn patterns for offset calculation, enumerate ROP gadgets, and pack/unpack integers with configurable endianness — directly inside the IDA context.
 
 ---
 
