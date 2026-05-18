@@ -24,7 +24,7 @@ Core API modules (upstream + enhanced):
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://`, `triton://`, `miasm://` MCP resources
 - `api_recon.py`: reconnaissance tools for stripped binaries — sections, global writers, VTable candidates, indirect calls, cleanup/method resolution, function prologue detection
-- `api_flirt.py`: FLIRT signature management tools
+- `api_flirt.py`: FLIRT signature management tools — apply signatures, load type libraries, and suggest names for unidentified functions via structural similarity scoring (prologue match, callee Jaccard, string xref overlap)
 - `api_survey.py`: one-call binary triage (metadata, segments, imports, strings, statistics)
 - `api_composite.py`: multi-step composite operations and cross-engine workflows
 - `api_discovery.py`: instance discovery and proxying

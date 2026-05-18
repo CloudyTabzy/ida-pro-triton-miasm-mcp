@@ -24,6 +24,12 @@ Based on a field test report from an AI agent (MiniMax-M2.7) conducting real rev
 |------|-------------|
 | `sync_debugger_to_idb(start, end, analyze)` | Read live debugger memory (`dbg_read_memory`) and patch it into the IDA database, then optionally run `plan_and_wait`. The complete one-call workflow for encrypted sections: run the target to the decrypt stub → call `sync_debugger_to_idb` → call `scan_and_define_funcs` → query `xrefs_to`. Marked `@unsafe @ext("dbg")`. |
 
+##### `api_flirt.py`
+
+| Tool | Description |
+|------|-------------|
+| `sig_suggest_candidates(segment, min_confidence, max_results, max_scan)` | FLIRT feedback loop: suggest names for unnamed `sub_XXXX` functions after signature matching stalls. Scores each candidate against already-named functions using three structural signals — prologue byte match (step-filtered at 75%/87.5%/100%, weight 0.40), named-callee Jaccard similarity (weight 0.40), and shared string-literal references (weight 0.20). Returns a ranked list with `suggested_name`, `confidence`, `reasons`, and `match_type`. Renaming a suggested function improves callee-based scoring for other candidates on subsequent passes, creating a converging feedback loop. |
+
 #### Enhanced Tools
 
 - **`define_func`** — `force=True` now calls `ida_auto.plan_and_wait(start, end)` before `add_func`, making function creation reliable in unanalysed regions. `del_items=True` (requires `force`) clears mis-typed bytes first. `existed: True` is returned (not an error) when the function already exists at the exact start address.

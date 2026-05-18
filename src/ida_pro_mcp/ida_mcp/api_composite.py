@@ -1004,10 +1004,16 @@ class IterativeDeobfuscateIteration(TypedDict, total=False):
     iteration: int
     block_count_before: int
     block_count_after: int
+    edge_count_before: int
+    edge_count_after: int
     ir_statements_before: int
     ir_statements_after: int
+    ir_reduction_pct: float
     candidates: list[HybridPatchCandidate]
+    blocks_removed: int
     patches_applied: int
+    bytes_nopped: int
+    patch_errors: list[str]
     verified: bool | None
     verification_mismatches: list[str]
     converged: bool
@@ -1019,7 +1025,10 @@ class IterativeDeobfuscateResult(TypedDict, total=False):
     function_ea: str
     iterations: list[IterativeDeobfuscateIteration]
     total_patches: int
+    total_blocks_removed: int
+    total_bytes_nopped: int
     converged: bool
+    final_state: str
     aborted_reason: str | None
     dry_run: bool
     error: str
@@ -1187,7 +1196,10 @@ def _verify_patches_with_triton(orig_bytes: bytes, func_start: int,
         return None, []
     read_regs = output_regs
 
-    patched_bytes = _build_patched_bytes(orig_bytes, func_start, candidates, nop_bytes)
+    try:
+        patched_bytes = _build_patched_bytes(orig_bytes, func_start, candidates, nop_bytes)
+    except Exception:
+        return None, []
     if patched_bytes == orig_bytes:
         return True, []
 
@@ -1217,6 +1229,18 @@ def _ir_statement_count(ircfg) -> int:
     total = 0
     for _, irblock in _iter_ircfg_blocks(ircfg):
         total += len(irblock)
+    return total
+
+
+def _ir_edge_count(ircfg) -> int:
+    """Count directed CFG edges in the IRCFG by summing successors of each block."""
+    from .api_miasm import _iter_ircfg_blocks
+    total = 0
+    for loc_key, _ in _iter_ircfg_blocks(ircfg):
+        try:
+            total += len(list(ircfg.successors(loc_key)))
+        except Exception:
+            pass
     return total
 
 
@@ -1320,9 +1344,9 @@ def hybrid_iterative_deobfuscate(
     abort that iteration's patch (the simplifier may have over-eliminated for
     that particular control flow).
 
-    Convergence is reached when both block_count and total IR statement count
-    are unchanged versus the previous iteration. Returns a per-iteration log
-    plus aggregated stats.
+    Convergence is reached when block_count, IR statement count, and CFG edge
+    count are all unchanged versus the previous iteration. Returns a per-iteration
+    log plus aggregated stats.
 
     `dry_run=True` (default) makes this safe to call exploratorily — the full
     Miasm pipeline runs and reports proposed patches without modifying the IDB.
@@ -1361,9 +1385,11 @@ def hybrid_iterative_deobfuscate(
 
         iterations: list[IterativeDeobfuscateIteration] = []
         total_patches = 0
+        total_blocks_removed = 0
+        total_bytes_nopped = 0
         converged = False
         aborted_reason: str | None = None
-        prev_signature: tuple[int, int] | None = None
+        prev_signature: tuple[int, int, int] | None = None
 
         for iter_idx in range(1, max_iterations + 1):
             # Re-fetch bounds each iteration; patches may shift IDA analysis.
@@ -1384,6 +1410,7 @@ def hybrid_iterative_deobfuscate(
                 break
 
             block_count_before = sum(1 for _ in _iter_ircfg_blocks(ircfg))
+            edge_count_before = _ir_edge_count(ircfg)
             ir_stmt_before = _ir_statement_count(ircfg)
 
             try:
@@ -1394,10 +1421,16 @@ def hybrid_iterative_deobfuscate(
                     "iteration": iter_idx,
                     "block_count_before": block_count_before,
                     "block_count_after": block_count_before,
+                    "edge_count_before": edge_count_before,
+                    "edge_count_after": edge_count_before,
                     "ir_statements_before": ir_stmt_before,
                     "ir_statements_after": ir_stmt_before,
+                    "ir_reduction_pct": 0.0,
                     "candidates": [],
+                    "blocks_removed": 0,
                     "patches_applied": 0,
+                    "bytes_nopped": 0,
+                    "patch_errors": [],
                     "verified": None,
                     "verification_mismatches": [],
                     "converged": False,
@@ -1407,21 +1440,34 @@ def hybrid_iterative_deobfuscate(
                 break
 
             block_count_after = sum(1 for _ in _iter_ircfg_blocks(ircfg))
+            edge_count_after = _ir_edge_count(ircfg)
             ir_stmt_after = _ir_statement_count(ircfg)
-            signature = (block_count_after, ir_stmt_after)
+            ir_reduction_pct = round(
+                (ir_stmt_before - ir_stmt_after) / ir_stmt_before * 100, 1
+            ) if ir_stmt_before > 0 else 0.0
+
+            # Convergence: all three structural metrics unchanged.
+            signature = (block_count_after, ir_stmt_after, edge_count_after)
 
             if prev_signature is not None and signature == prev_signature:
                 iterations.append({
                     "iteration": iter_idx,
                     "block_count_before": block_count_before,
                     "block_count_after": block_count_after,
+                    "edge_count_before": edge_count_before,
+                    "edge_count_after": edge_count_after,
                     "ir_statements_before": ir_stmt_before,
                     "ir_statements_after": ir_stmt_after,
+                    "ir_reduction_pct": ir_reduction_pct,
                     "candidates": [],
+                    "blocks_removed": 0,
                     "patches_applied": 0,
+                    "bytes_nopped": 0,
+                    "patch_errors": [],
                     "verified": None,
                     "verification_mismatches": [],
                     "converged": True,
+                    "note": "signature unchanged — converged",
                 })
                 converged = True
                 break
@@ -1438,10 +1484,24 @@ def hybrid_iterative_deobfuscate(
                 )
 
             patches_applied = 0
-            note = ""
+            bytes_nopped_iter = 0
+            patch_errors: list[str] = []
+            note_parts: list[str] = []
+
+            if verify_with_triton and verified is None and candidates:
+                if dry_run:
+                    note_parts.append(
+                        "Triton verification inconclusive (unavailable or all runs errored)"
+                    )
+                else:
+                    note_parts.append(
+                        "Triton verification inconclusive (unavailable or all runs errored); "
+                        "patches applied without verification"
+                    )
+
             if candidates and not dry_run:
                 if verify_with_triton and verified is False:
-                    note = "patches skipped: Triton verification mismatch"
+                    note_parts.append("patches skipped: Triton verification mismatch")
                 else:
                     for cand in candidates:
                         try:
@@ -1452,39 +1512,67 @@ def hybrid_iterative_deobfuscate(
                             sled = _nop_sled(nop_bytes, size)
                             if ida_bytes.patch_bytes(addr, sled):
                                 patches_applied += 1
-                        except Exception:
-                            continue
+                                bytes_nopped_iter += size
+                        except RuntimeError as exc:
+                            patch_errors.append(
+                                f"{cand['address']}: {exc}"
+                            )
+                        except Exception as exc:
+                            patch_errors.append(
+                                f"{cand['address']}: {type(exc).__name__}: {exc}"
+                            )
                     if patches_applied:
                         idaapi.auto_wait()
                     total_patches += patches_applied
+                    total_bytes_nopped += bytes_nopped_iter
+
+            blocks_removed_iter = patches_applied
+            total_blocks_removed += blocks_removed_iter
 
             iterations.append({
                 "iteration": iter_idx,
                 "block_count_before": block_count_before,
                 "block_count_after": block_count_after,
+                "edge_count_before": edge_count_before,
+                "edge_count_after": edge_count_after,
                 "ir_statements_before": ir_stmt_before,
                 "ir_statements_after": ir_stmt_after,
+                "ir_reduction_pct": ir_reduction_pct,
                 "candidates": candidates,
+                "blocks_removed": blocks_removed_iter,
                 "patches_applied": patches_applied,
+                "bytes_nopped": bytes_nopped_iter,
+                "patch_errors": patch_errors,
                 "verified": verified,
                 "verification_mismatches": mismatches,
                 "converged": False,
-                "note": note,
+                "note": "; ".join(note_parts),
             })
 
             # No candidates AND structurally unchanged → converged.
             if not candidates and block_count_after == block_count_before \
-                    and ir_stmt_after == ir_stmt_before:
+                    and ir_stmt_after == ir_stmt_before \
+                    and edge_count_after == edge_count_before:
                 converged = True
                 iterations[-1]["converged"] = True
                 break
+
+        if converged:
+            final_state = "converged"
+        elif aborted_reason:
+            final_state = "aborted"
+        else:
+            final_state = "max_iterations"
 
         return {
             "ok": True,
             "function_ea": hex(func_start),
             "iterations": iterations,
             "total_patches": total_patches,
+            "total_blocks_removed": total_blocks_removed,
+            "total_bytes_nopped": total_bytes_nopped,
             "converged": converged,
+            "final_state": final_state,
             "aborted_reason": aborted_reason,
             "dry_run": dry_run,
         }
