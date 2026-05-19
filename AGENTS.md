@@ -535,6 +535,23 @@ Do not add Triton/Miasm/Construct logic to any file that upstream also maintains
 - **Start node is always visited** even if it would be filtered by xref type — it is the traversal origin, not an xref target.
 - **`functions_entered`** is included in the result when `cross_functions=True`, listing every function whose basic blocks were expanded into the traversal.
 
+### `deobfuscate_segment`
+
+**What it does:** Segment-level batch deobfuscation. Fast-screens every function in a segment using IDA `FlowChart` (no Miasm), ranks by composite obfuscation score, then runs the iterative Miasm simplification pipeline on the top candidates.
+
+**Obfuscation score formula:**
+- `branch_density = edge_count / block_count`
+- `block_size_score = block_count / (size_bytes / 20)`
+- `complexity_score = min(cyclomatic_complexity / 20, 3.0)`
+- `score = 0.35*branch_density + 0.35*min(block_size_score,5.0) + 0.30*complexity_score`
+
+**Accuracy notes for AI agents:**
+- **Screening is pure IDA; Miasm is only used for candidates.** This makes the scan fast (seconds for thousands of functions) but the score is a heuristic. Legitimate code with extreme control-flow complexity (large switch tables, heavy error-handling) may score >1.5. Tune `complexity_threshold` or set `min_function_size` to filter out tiny stubs.
+- **Candidates are sorted by score descending** and capped at `max_functions` (clamped 1–500). The result includes every candidate's raw metrics so you can adjust the threshold for a second pass.
+- **`exclude_libraries=True` (default)** skips functions marked `FUNC_LIB`. If a packer/obfuscator has already been partially identified by FLIRT, its stubs may be marked library and skipped — disable this if you want to target them.
+- **Per-function error isolation:** One candidate failing does not abort the batch. After 10 consecutive failures the batch aborts early with `aborted_early=True` to avoid spinning on systemic corruption or architecture mismatch.
+- **`_hybrid_iterative_deobfuscate_core`** is the same pipeline as `hybrid_iterative_deobfuscate` (convergence on block/edge/IR-stmt signature, optional Triton verification, NOP patching). The batch tool simply calls it in a loop.
+
 ---
 
 ## Hard-won lessons & debugging strategy

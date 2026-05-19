@@ -162,6 +162,56 @@ def _basic_block_info(ea: int) -> BasicBlockSummary:
     return {"count": nodes, "cyclomatic_complexity": edges - nodes + 2}
 
 
+def _compute_obfuscation_score(func_ea: int) -> dict | None:
+    """Fast obfuscation screening using only IDA native APIs (no Miasm).
+
+    Returns a composite score and raw metrics, or None if the function
+    cannot be analysed.
+    """
+    import idaapi
+    import idautils
+    import ida_funcs
+
+    func = idaapi.get_func(func_ea)
+    if func is None:
+        return None
+    size = func.end_ea - func.start_ea
+    if size <= 0:
+        return None
+
+    fc = idaapi.FlowChart(func)
+    block_count = 0
+    edge_count = 0
+    for block in fc:
+        block_count += 1
+        edge_count += len(list(block.succs()))
+    if block_count == 0:
+        return None
+
+    cc = edge_count - block_count + 2
+    instr_count = sum(1 for _ in idautils.FuncItems(func_ea))
+
+    # Three normalized signals
+    branch_density = edge_count / block_count
+    block_size_score = block_count / max(size / 20, 1)
+    complexity_score = min(cc / 20, 3.0)
+
+    score = (
+        branch_density * 0.35
+        + min(block_size_score, 5.0) * 0.35
+        + complexity_score * 0.30
+    )
+
+    return {
+        "block_count": block_count,
+        "edge_count": edge_count,
+        "cyclomatic_complexity": cc,
+        "instruction_count": instr_count,
+        "size": size,
+        "obfuscation_score": round(score, 2),
+    }
+
+
 def _filter_constants(raw: list[dict], limit: int = _TOP_CONSTANTS) -> list[dict]:
     """Drop boring constants, return top N by absolute value."""
     out = []
@@ -1034,6 +1084,49 @@ class IterativeDeobfuscateResult(TypedDict, total=False):
     error: str
 
 
+class DeobfuscateSegmentCandidate(TypedDict):
+    addr: str
+    name: str
+    size: int
+    block_count: int
+    edge_count: int
+    cyclomatic_complexity: int
+    obfuscation_score: float
+
+
+class DeobfuscateSegmentFunctionResult(TypedDict, total=False):
+    addr: str
+    name: str
+    obfuscation_score: float
+    iterations: list[IterativeDeobfuscateIteration]
+    total_patches: int
+    total_blocks_removed: int
+    total_bytes_nopped: int
+    converged: bool
+    final_state: str
+    error: str | None
+
+
+class DeobfuscateSegmentResult(TypedDict, total=False):
+    ok: bool
+    segment: str
+    segment_start: str
+    segment_end: str
+    scanned_functions: int
+    candidate_count: int
+    candidates: list[DeobfuscateSegmentCandidate]
+    processed: int
+    results: list[DeobfuscateSegmentFunctionResult]
+    total_patches: int
+    total_blocks_removed: int
+    total_bytes_nopped: int
+    errors: list[dict]
+    dry_run: bool
+    aborted_early: bool
+    aborted_reason: str | None
+    error: str | None
+
+
 # Calling-convention registers per arch. Used by the Triton verification
 # pass to seed random concrete inputs and to read output registers.
 #
@@ -1307,6 +1400,231 @@ def _identify_dead_candidates(asmcfg, ircfg, lifter) -> list[HybridPatchCandidat
     return candidates
 
 
+def _hybrid_iterative_deobfuscate_core(
+    func_start: int,
+    max_iterations: int,
+    verify_with_triton: bool,
+    verify_samples: int,
+    dry_run: bool,
+    confirm: bool,
+    max_insns: int,
+) -> dict:
+    """Core iterative deobfuscation logic. Must be called on the IDA main thread."""
+    import idaapi
+    import ida_funcs
+    import ida_bytes
+
+    from .api_miasm import _manager, _iter_ircfg_blocks
+    from miasm.analysis.simplifier import IRCFGSimplifierCommon
+
+    nop_bytes = _build_arch_nop(_manager.bitness)
+
+    iterations: list[IterativeDeobfuscateIteration] = []
+    total_patches = 0
+    total_blocks_removed = 0
+    total_bytes_nopped = 0
+    converged = False
+    aborted_reason: str | None = None
+    prev_signature: tuple[int, int, int] | None = None
+
+    for iter_idx in range(1, max_iterations + 1):
+        func = ida_funcs.get_func(func_start) or ida_funcs.get_func(func_start)
+        if func is None:
+            aborted_reason = f"function disappeared at {hex(func_start)}"
+            break
+        data = _manager.get_bytes(func.start_ea, func.end_ea)
+        if data is None:
+            aborted_reason = f"could not read bytes at {hex(func.start_ea)}"
+            break
+
+        mdis, loc_db = _manager.get_mdis(data, func.start_ea)
+        asmcfg = mdis.dis_multiblock(func.start_ea)
+        lifter = _manager.machine.lifter_model_call(loc_db)
+        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+
+        head = loc_db.get_offset_location(func.start_ea)
+        if head is None:
+            aborted_reason = "no head location key for function entry"
+            break
+
+        block_count_before = sum(1 for _ in _iter_ircfg_blocks(ircfg))
+        edge_count_before = _ir_edge_count(ircfg)
+        ir_stmt_before = _ir_statement_count(ircfg)
+
+        try:
+            simplifier = IRCFGSimplifierCommon(lifter)
+            simplifier(ircfg, head)
+        except Exception as exc:
+            iterations.append({
+                "iteration": iter_idx,
+                "block_count_before": block_count_before,
+                "block_count_after": block_count_before,
+                "edge_count_before": edge_count_before,
+                "edge_count_after": edge_count_before,
+                "ir_statements_before": ir_stmt_before,
+                "ir_statements_after": ir_stmt_before,
+                "ir_reduction_pct": 0.0,
+                "candidates": [],
+                "blocks_removed": 0,
+                "patches_applied": 0,
+                "bytes_nopped": 0,
+                "patch_errors": [],
+                "verified": None,
+                "verification_mismatches": [],
+                "converged": False,
+                "note": f"simplifier raised: {type(exc).__name__}: {exc}",
+            })
+            aborted_reason = "simplifier exception"
+            break
+
+        block_count_after = sum(1 for _ in _iter_ircfg_blocks(ircfg))
+        edge_count_after = _ir_edge_count(ircfg)
+        ir_stmt_after = _ir_statement_count(ircfg)
+        ir_reduction_pct = round(
+            (ir_stmt_before - ir_stmt_after) / ir_stmt_before * 100, 1
+        ) if ir_stmt_before > 0 else 0.0
+
+        block_count_final = block_count_after
+        edge_count_final = edge_count_after
+        ir_stmt_final = ir_stmt_after
+
+        signature = (block_count_final, ir_stmt_final, edge_count_final)
+
+        if prev_signature is not None and signature == prev_signature:
+            iterations.append({
+                "iteration": iter_idx,
+                "block_count_before": prev_signature[0],
+                "block_count_after": block_count_final,
+                "edge_count_before": prev_signature[2],
+                "edge_count_after": edge_count_final,
+                "ir_statements_before": prev_signature[1],
+                "ir_statements_after": ir_stmt_final,
+                "ir_reduction_pct": ir_reduction_pct,
+                "candidates": [],
+                "blocks_removed": 0,
+                "patches_applied": 0,
+                "bytes_nopped": 0,
+                "patch_errors": [],
+                "verified": None,
+                "verification_mismatches": [],
+                "converged": True,
+                "note": "signature unchanged — converged",
+            })
+            converged = True
+            break
+        prev_signature = signature
+        block_count_final = block_count_after
+        edge_count_final = edge_count_after
+        ir_stmt_final = ir_stmt_after
+
+        candidates = _identify_dead_candidates(asmcfg, ircfg, lifter)
+
+        signature = (block_count_final, ir_stmt_final, edge_count_final)
+
+        verified: bool | None = None
+        mismatches: list[str] = []
+        if candidates and verify_with_triton:
+            verified, mismatches = _verify_patches_with_triton(
+                data, func.start_ea, candidates, nop_bytes,
+                verify_samples, max_insns,
+            )
+
+        patches_applied = 0
+        bytes_nopped_iter = 0
+        patch_errors: list[str] = []
+        note_parts: list[str] = []
+
+        if verify_with_triton and verified is None and candidates:
+            if dry_run:
+                note_parts.append(
+                    "Triton verification inconclusive (unavailable or all runs errored)"
+                )
+            else:
+                note_parts.append(
+                    "Triton verification inconclusive (unavailable or all runs errored); "
+                    "patches applied without verification"
+                )
+
+        if candidates and not dry_run:
+            if verify_with_triton and verified is False:
+                note_parts.append("patches skipped: Triton verification mismatch")
+            else:
+                for cand in candidates:
+                    try:
+                        addr = int(cand["address"], 16)
+                        size = cand["size"]
+                        if size <= 0:
+                            continue
+                        sled = _nop_sled(nop_bytes, size)
+                        if ida_bytes.patch_bytes(addr, sled):
+                            patches_applied += 1
+                            bytes_nopped_iter += size
+                    except RuntimeError as exc:
+                        patch_errors.append(
+                            f"{cand['address']}: {exc}"
+                        )
+                    except Exception as exc:
+                        patch_errors.append(
+                            f"{cand['address']}: {type(exc).__name__}: {exc}"
+                        )
+                if patches_applied:
+                    idaapi.auto_wait()
+                total_patches += patches_applied
+                total_bytes_nopped += bytes_nopped_iter
+
+        blocks_removed_iter = patches_applied
+        total_blocks_removed += blocks_removed_iter
+
+        iterations.append({
+            "iteration": iter_idx,
+            "block_count_before": block_count_before,
+            "block_count_after": block_count_after,
+            "edge_count_before": edge_count_before,
+            "edge_count_after": edge_count_after,
+            "ir_statements_before": ir_stmt_before,
+            "ir_statements_after": ir_stmt_after,
+            "ir_reduction_pct": ir_reduction_pct,
+            "candidates": candidates,
+            "blocks_removed": blocks_removed_iter,
+            "patches_applied": patches_applied,
+            "bytes_nopped": bytes_nopped_iter,
+            "patch_errors": patch_errors,
+            "verified": verified,
+            "verification_mismatches": mismatches,
+            "converged": False,
+            "note": "; ".join(note_parts),
+        })
+
+        if not candidates and block_count_after == block_count_before \
+                and ir_stmt_after == ir_stmt_before \
+                and edge_count_after == edge_count_before:
+            converged = True
+            iterations[-1]["converged"] = True
+            break
+
+        prev_signature = (block_count_final, ir_stmt_final, edge_count_final)
+
+    if converged:
+        final_state = "converged"
+    elif aborted_reason:
+        final_state = "aborted"
+    else:
+        final_state = "max_iterations"
+
+    return {
+        "ok": True,
+        "function_ea": hex(func_start),
+        "iterations": iterations,
+        "total_patches": total_patches,
+        "total_blocks_removed": total_blocks_removed,
+        "total_bytes_nopped": total_bytes_nopped,
+        "converged": converged,
+        "final_state": final_state,
+        "aborted_reason": aborted_reason,
+        "dry_run": dry_run,
+    }
+
+
 @unsafe
 @tool
 @idasync
@@ -1370,230 +1688,207 @@ def hybrid_iterative_deobfuscate(
         }
 
     try:
-        from miasm.analysis.simplifier import IRCFGSimplifierCommon
-    except ImportError as exc:
-        return {"ok": False, "error": f"miasm.analysis.simplifier unavailable: {exc}"}
-
-    try:
         ea = parse_address(address)
         func = ida_funcs.get_func(ea)
         if func is None:
             return {"ok": False, "error": f"No function at {hex(ea)}"}
-        func_start = func.start_ea
-
-        nop_bytes = _build_arch_nop(_manager.bitness)
-
-        iterations: list[IterativeDeobfuscateIteration] = []
-        total_patches = 0
-        total_blocks_removed = 0
-        total_bytes_nopped = 0
-        converged = False
-        aborted_reason: str | None = None
-        prev_signature: tuple[int, int, int] | None = None
-
-        for iter_idx in range(1, max_iterations + 1):
-            # Re-fetch bounds each iteration; patches may shift IDA analysis.
-            func = ida_funcs.get_func(func_start) or func
-            data = _manager.get_bytes(func.start_ea, func.end_ea)
-            if data is None:
-                aborted_reason = f"could not read bytes at {hex(func.start_ea)}"
-                break
-
-            mdis, loc_db = _manager.get_mdis(data, func.start_ea)
-            asmcfg = mdis.dis_multiblock(func.start_ea)
-            lifter = _manager.machine.lifter_model_call(loc_db)
-            ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
-
-            head = loc_db.get_offset_location(func.start_ea)
-            if head is None:
-                aborted_reason = "no head location key for function entry"
-                break
-
-            block_count_before = sum(1 for _ in _iter_ircfg_blocks(ircfg))
-            edge_count_before = _ir_edge_count(ircfg)
-            ir_stmt_before = _ir_statement_count(ircfg)
-
-            try:
-                simplifier = IRCFGSimplifierCommon(lifter)
-                simplifier(ircfg, head)
-            except Exception as exc:
-                iterations.append({
-                    "iteration": iter_idx,
-                    "block_count_before": block_count_before,
-                    "block_count_after": block_count_before,
-                    "edge_count_before": edge_count_before,
-                    "edge_count_after": edge_count_before,
-                    "ir_statements_before": ir_stmt_before,
-                    "ir_statements_after": ir_stmt_before,
-                    "ir_reduction_pct": 0.0,
-                    "candidates": [],
-                    "blocks_removed": 0,
-                    "patches_applied": 0,
-                    "bytes_nopped": 0,
-                    "patch_errors": [],
-                    "verified": None,
-                    "verification_mismatches": [],
-                    "converged": False,
-                    "note": f"simplifier raised: {type(exc).__name__}: {exc}",
-                })
-                aborted_reason = "simplifier exception"
-                break
-
-            block_count_after = sum(1 for _ in _iter_ircfg_blocks(ircfg))
-            edge_count_after = _ir_edge_count(ircfg)
-            ir_stmt_after = _ir_statement_count(ircfg)
-            ir_reduction_pct = round(
-                (ir_stmt_before - ir_stmt_after) / ir_stmt_before * 100, 1
-            ) if ir_stmt_before > 0 else 0.0
-
-            block_count_final = block_count_after
-            edge_count_final = edge_count_after
-            ir_stmt_final = ir_stmt_after
-
-            # Convergence: all three structural metrics unchanged.
-            signature = (block_count_final, ir_stmt_final, edge_count_final)
-
-            if prev_signature is not None and signature == prev_signature:
-                # Use the previous iteration's post-simplification counts as
-                # the "before" values for the convergence record, since
-                # block_count_before would be re-computed from the (unchanged)
-                # post-simplification state at the start of this iteration.
-                iterations.append({
-                    "iteration": iter_idx,
-                    "block_count_before": prev_signature[0],
-                    "block_count_after": block_count_final,
-                    "edge_count_before": prev_signature[2],
-                    "edge_count_after": edge_count_final,
-                    "ir_statements_before": prev_signature[1],
-                    "ir_statements_after": ir_stmt_final,
-                    "ir_reduction_pct": ir_reduction_pct,
-                    "candidates": [],
-                    "blocks_removed": 0,
-                    "patches_applied": 0,
-                    "bytes_nopped": 0,
-                    "patch_errors": [],
-                    "verified": None,
-                    "verification_mismatches": [],
-                    "converged": True,
-                    "note": "signature unchanged — converged",
-                })
-                converged = True
-                break
-            prev_signature = signature
-            block_count_final = block_count_after
-            edge_count_final = edge_count_after
-            ir_stmt_final = ir_stmt_after
-
-            candidates = _identify_dead_candidates(asmcfg, ircfg, lifter)
-
-            # Convergence: all three structural metrics unchanged.
-            signature = (block_count_final, ir_stmt_final, edge_count_final)
-
-            verified: bool | None = None
-            mismatches: list[str] = []
-            if candidates and verify_with_triton:
-                verified, mismatches = _verify_patches_with_triton(
-                    data, func.start_ea, candidates, nop_bytes,
-                    verify_samples, max_insns,
-                )
-
-            patches_applied = 0
-            bytes_nopped_iter = 0
-            patch_errors: list[str] = []
-            note_parts: list[str] = []
-
-            if verify_with_triton and verified is None and candidates:
-                if dry_run:
-                    note_parts.append(
-                        "Triton verification inconclusive (unavailable or all runs errored)"
-                    )
-                else:
-                    note_parts.append(
-                        "Triton verification inconclusive (unavailable or all runs errored); "
-                        "patches applied without verification"
-                    )
-
-            if candidates and not dry_run:
-                if verify_with_triton and verified is False:
-                    note_parts.append("patches skipped: Triton verification mismatch")
-                else:
-                    for cand in candidates:
-                        try:
-                            addr = int(cand["address"], 16)
-                            size = cand["size"]
-                            if size <= 0:
-                                continue
-                            sled = _nop_sled(nop_bytes, size)
-                            if ida_bytes.patch_bytes(addr, sled):
-                                patches_applied += 1
-                                bytes_nopped_iter += size
-                        except RuntimeError as exc:
-                            patch_errors.append(
-                                f"{cand['address']}: {exc}"
-                            )
-                        except Exception as exc:
-                            patch_errors.append(
-                                f"{cand['address']}: {type(exc).__name__}: {exc}"
-                            )
-                    if patches_applied:
-                        idaapi.auto_wait()
-                    total_patches += patches_applied
-                    total_bytes_nopped += bytes_nopped_iter
-
-            blocks_removed_iter = patches_applied
-            total_blocks_removed += blocks_removed_iter
-
-            iterations.append({
-                "iteration": iter_idx,
-                "block_count_before": block_count_before,
-                "block_count_after": block_count_after,
-                "edge_count_before": edge_count_before,
-                "edge_count_after": edge_count_after,
-                "ir_statements_before": ir_stmt_before,
-                "ir_statements_after": ir_stmt_after,
-                "ir_reduction_pct": ir_reduction_pct,
-                "candidates": candidates,
-                "blocks_removed": blocks_removed_iter,
-                "patches_applied": patches_applied,
-                "bytes_nopped": bytes_nopped_iter,
-                "patch_errors": patch_errors,
-                "verified": verified,
-                "verification_mismatches": mismatches,
-                "converged": False,
-                "note": "; ".join(note_parts),
-            })
-
-            # No candidates AND structurally unchanged → converged.
-            if not candidates and block_count_after == block_count_before \
-                    and ir_stmt_after == ir_stmt_before \
-                    and edge_count_after == edge_count_before:
-                converged = True
-                iterations[-1]["converged"] = True
-                break
-
-            prev_signature = (block_count_final, ir_stmt_final, edge_count_final)
-
-        if converged:
-            final_state = "converged"
-        elif aborted_reason:
-            final_state = "aborted"
-        else:
-            final_state = "max_iterations"
-
-        return {
-            "ok": True,
-            "function_ea": hex(func_start),
-            "iterations": iterations,
-            "total_patches": total_patches,
-            "total_blocks_removed": total_blocks_removed,
-            "total_bytes_nopped": total_bytes_nopped,
-            "converged": converged,
-            "final_state": final_state,
-            "aborted_reason": aborted_reason,
-            "dry_run": dry_run,
-        }
-
+        return _hybrid_iterative_deobfuscate_core(
+            func.start_ea,
+            max_iterations,
+            verify_with_triton,
+            verify_samples,
+            dry_run,
+            confirm,
+            max_insns,
+        )
     except IDAError as exc:
         return {"ok": False, "error": exc.message}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+@unsafe
+@tool
+@idasync
+@tool_timeout(600.0)
+def deobfuscate_segment(
+    segment: Annotated[str, "Segment name (e.g. '.text') or hex address within the segment."] = ".text",
+    max_functions: Annotated[int, "Maximum candidate functions to process (default 100, max 500)."] = 100,
+    complexity_threshold: Annotated[float, "Minimum obfuscation score to qualify (default 1.5)."] = 1.5,
+    min_function_size: Annotated[int, "Skip functions smaller than N bytes (default 16)."] = 16,
+    exclude_libraries: Annotated[bool, "Skip IDA-identified library functions (default True)."] = True,
+    dry_run: Annotated[bool, "Preview only; do not patch (default True)."] = True,
+    confirm: Annotated[bool, "Required when dry_run=False for destructive patching."] = False,
+    verify_with_triton: Annotated[bool, "Verify each patch with Triton equivalence checks."] = True,
+    verify_samples: Annotated[int, "Random inputs per Triton verification (default 5)."] = 5,
+    max_iterations: Annotated[int, "Max simplification passes per function (default 10)."] = 10,
+    max_insns: Annotated[int, "Triton instruction cap per verification run (default 500)."] = 500,
+) -> DeobfuscateSegmentResult:
+    """Batch-deobfuscate likely-obfuscated functions across a segment.
+
+    Scans every function in the target segment, ranks them by a composite
+    obfuscation score (branch density, block size, cyclomatic complexity),
+    and runs the iterative Miasm deobfuscation pipeline on the top candidates.
+
+    `dry_run=True` (default) previews candidates and runs the full analysis
+    pipeline without writing patches to the IDB.
+    """
+    import ida_segment
+    import idautils
+    import ida_funcs
+
+    try:
+        from .api_miasm import MIASM_AVAILABLE
+    except ImportError as exc:
+        return {"ok": False, "error": f"Import error: {exc}"}
+
+    if not MIASM_AVAILABLE:
+        return {"ok": False, "error": "Miasm not available. Install: pip install miasm future"}
+
+    if not dry_run and not confirm:
+        return {
+            "ok": False,
+            "error": "confirm=True is required when dry_run=False. Set dry_run=True to preview patches.",
+        }
+
+    seg = None
+    if segment.lower().startswith("0x"):
+        try:
+            ea = int(segment, 16)
+            seg = ida_segment.getseg(ea)
+        except ValueError:
+            return {"ok": False, "error": f"Invalid segment address: {segment}"}
+    else:
+        seg = idaapi.get_segm_by_name(segment)
+        if seg is None:
+            seg_name_l = segment.lower()
+            for seg_ea in idautils.Segments():
+                s = ida_segment.getseg(seg_ea)
+                if s is None:
+                    continue
+                name = ida_segment.get_segm_name(s) or ""
+                if name.lower() == seg_name_l:
+                    seg = s
+                    break
+
+    if seg is None:
+        return {"ok": False, "error": f"Segment not found: {segment}"}
+
+    seg_name = ida_segment.get_segm_name(seg) or segment
+    scanned = 0
+    candidates = []
+
+    for func_ea in idautils.Functions(seg.start_ea, seg.end_ea):
+        scanned += 1
+        func = ida_funcs.get_func(func_ea)
+        if func is None:
+            continue
+        size = func.end_ea - func.start_ea
+        if size < min_function_size:
+            continue
+        if exclude_libraries and (func.flags & ida_funcs.FUNC_LIB):
+            continue
+        score_info = _compute_obfuscation_score(func_ea)
+        if score_info is None:
+            continue
+        if score_info["obfuscation_score"] < complexity_threshold:
+            continue
+        name = ida_funcs.get_func_name(func_ea) or ""
+        candidates.append({
+            "addr": hex(func_ea),
+            "name": name,
+            "size": size,
+            "block_count": score_info["block_count"],
+            "edge_count": score_info["edge_count"],
+            "cyclomatic_complexity": score_info["cyclomatic_complexity"],
+            "obfuscation_score": score_info["obfuscation_score"],
+        })
+
+    candidates.sort(key=lambda c: c["obfuscation_score"], reverse=True)
+    capped_max = max(1, min(max_functions, 500))
+    selected = candidates[:capped_max]
+
+    results = []
+    errors = []
+    total_patches = 0
+    total_blocks_removed = 0
+    total_bytes_nopped = 0
+    aborted_early = False
+    aborted_reason = None
+    consecutive_failures = 0
+    max_consecutive_failures = 10
+
+    for cand in selected:
+        func_ea = int(cand["addr"], 16)
+        try:
+            result = _hybrid_iterative_deobfuscate_core(
+                func_ea,
+                max_iterations,
+                verify_with_triton,
+                verify_samples,
+                dry_run,
+                confirm,
+                max_insns,
+            )
+            consecutive_failures = 0
+            total_patches += result.get("total_patches", 0)
+            total_blocks_removed += result.get("total_blocks_removed", 0)
+            total_bytes_nopped += result.get("total_bytes_nopped", 0)
+            results.append({
+                "addr": cand["addr"],
+                "name": cand["name"],
+                "obfuscation_score": cand["obfuscation_score"],
+                "iterations": result.get("iterations", []),
+                "total_patches": result.get("total_patches", 0),
+                "total_blocks_removed": result.get("total_blocks_removed", 0),
+                "total_bytes_nopped": result.get("total_bytes_nopped", 0),
+                "converged": result.get("converged", False),
+                "final_state": result.get("final_state", "unknown"),
+                "error": None,
+            })
+        except Exception as exc:
+            consecutive_failures += 1
+            err_text = f"{type(exc).__name__}: {exc}"
+            errors.append({
+                "addr": cand["addr"],
+                "name": cand["name"],
+                "error": err_text,
+            })
+            results.append({
+                "addr": cand["addr"],
+                "name": cand["name"],
+                "obfuscation_score": cand["obfuscation_score"],
+                "iterations": [],
+                "total_patches": 0,
+                "total_blocks_removed": 0,
+                "total_bytes_nopped": 0,
+                "converged": False,
+                "final_state": "error",
+                "error": err_text,
+            })
+            if consecutive_failures >= max_consecutive_failures:
+                aborted_early = True
+                aborted_reason = (
+                    f"Aborted after {max_consecutive_failures} consecutive failures — "
+                    "likely systemic issue (Miasm crash, corrupted bytes, or architecture mismatch)."
+                )
+                break
+
+    return {
+        "ok": True,
+        "segment": seg_name,
+        "segment_start": hex(seg.start_ea),
+        "segment_end": hex(seg.end_ea),
+        "scanned_functions": scanned,
+        "candidate_count": len(candidates),
+        "candidates": selected,
+        "processed": len(results),
+        "results": results,
+        "total_patches": total_patches,
+        "total_blocks_removed": total_blocks_removed,
+        "total_bytes_nopped": total_bytes_nopped,
+        "errors": errors,
+        "dry_run": dry_run,
+        "aborted_early": aborted_early,
+        "aborted_reason": aborted_reason,
+    }

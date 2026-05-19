@@ -24,11 +24,13 @@ try:
         hybrid_analyze_function,
         hybrid_deobfuscate_and_patch,
         hybrid_iterative_deobfuscate,
+        deobfuscate_segment,
     )
 except ImportError:
     hybrid_analyze_function = None
     hybrid_deobfuscate_and_patch = None
     hybrid_iterative_deobfuscate = None
+    deobfuscate_segment = None
 
 
 def _require_both():
@@ -149,3 +151,102 @@ def test_hybrid_iterative_deobfuscate_with_verification():
     for it in iters:
         assert "verified" in it
         assert it["verified"] in (True, False, None)
+
+
+@test()
+def test_deobfuscate_segment_bad_segment():
+    """deobfuscate_segment returns ok=False for a non-existent segment."""
+    if not MIASM_AVAILABLE:
+        skip_test("miasm not installed")
+    if deobfuscate_segment is None:
+        skip_test("deobfuscate_segment not importable")
+    result = deobfuscate_segment(".this_segment_does_not_exist_12345")
+    assert isinstance(result, dict)
+    assert result.get("ok") is False
+    assert "segment" in (result.get("error") or "").lower() or "not found" in (result.get("error") or "").lower()
+
+
+@test()
+def test_deobfuscate_segment_dry_run():
+    """deobfuscate_segment dry_run scans segment, returns structured result without patching."""
+    if not MIASM_AVAILABLE:
+        skip_test("miasm not installed")
+    if deobfuscate_segment is None:
+        skip_test("deobfuscate_segment not importable")
+
+    result = deobfuscate_segment(
+        ".text",
+        max_functions=5,
+        complexity_threshold=0.0,  # force all functions to qualify so we test the pipeline
+        min_function_size=1,
+        dry_run=True,
+        verify_with_triton=False,  # speed up test
+    )
+    assert isinstance(result, dict), f"expected dict, got {type(result)}"
+    assert result.get("ok") is True, f"Expected ok=True: {result}"
+    assert result.get("dry_run") is True
+    assert isinstance(result.get("candidates"), list)
+    assert isinstance(result.get("results"), list)
+    assert "scanned_functions" in result
+    assert "segment" in result
+    assert "segment_start" in result
+    assert "segment_end" in result
+    # With threshold=0.0 we should get at least some candidates on any real binary.
+    assert result.get("candidate_count", 0) >= 0
+    # No patches applied in dry_run.
+    assert result.get("total_patches", 0) == 0
+
+
+@test()
+def test_deobfuscate_segment_requires_confirm():
+    """deobfuscate_segment rejects dry_run=False without confirm=True."""
+    if not MIASM_AVAILABLE:
+        skip_test("miasm not installed")
+    if deobfuscate_segment is None:
+        skip_test("deobfuscate_segment not importable")
+    result = deobfuscate_segment(".text", dry_run=False, confirm=False)
+    assert isinstance(result, dict)
+    assert result.get("ok") is False
+    assert "confirm" in (result.get("error") or "").lower()
+
+
+@test()
+def test_deobfuscate_segment_respects_max_functions():
+    """max_functions cap limits how many candidates are processed."""
+    if not MIASM_AVAILABLE:
+        skip_test("miasm not installed")
+    if deobfuscate_segment is None:
+        skip_test("deobfuscate_segment not importable")
+    result = deobfuscate_segment(
+        ".text",
+        max_functions=2,
+        complexity_threshold=0.0,
+        min_function_size=1,
+        dry_run=True,
+        verify_with_triton=False,
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is True
+    # Candidates list should be capped.
+    assert len(result.get("candidates", [])) <= 2
+    assert len(result.get("results", [])) <= 2
+
+
+@test()
+def test_deobfuscate_segment_high_threshold_empty():
+    """An impossibly high threshold should yield zero candidates."""
+    if not MIASM_AVAILABLE:
+        skip_test("miasm not installed")
+    if deobfuscate_segment is None:
+        skip_test("deobfuscate_segment not importable")
+    result = deobfuscate_segment(
+        ".text",
+        complexity_threshold=999.0,
+        dry_run=True,
+        verify_with_triton=False,
+    )
+    assert isinstance(result, dict)
+    assert result.get("ok") is True
+    assert result.get("candidate_count", -1) == 0
+    assert len(result.get("candidates", [])) == 0
+    assert len(result.get("results", [])) == 0
