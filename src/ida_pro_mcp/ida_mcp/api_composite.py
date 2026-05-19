@@ -169,7 +169,6 @@ def _compute_obfuscation_score(func_ea: int) -> dict | None:
     cannot be analysed.
     """
     import idaapi
-    import idautils
     import ida_funcs
 
     func = idaapi.get_func(func_ea)
@@ -189,7 +188,6 @@ def _compute_obfuscation_score(func_ea: int) -> dict | None:
         return None
 
     cc = edge_count - block_count + 2
-    instr_count = sum(1 for _ in idautils.FuncItems(func_ea))
 
     # Three normalized signals
     branch_density = edge_count / block_count
@@ -206,7 +204,6 @@ def _compute_obfuscation_score(func_ea: int) -> dict | None:
         "block_count": block_count,
         "edge_count": edge_count,
         "cyclomatic_complexity": cc,
-        "instruction_count": instr_count,
         "size": size,
         "obfuscation_score": round(score, 2),
     }
@@ -1425,10 +1422,14 @@ def _hybrid_iterative_deobfuscate_core(
     total_bytes_nopped = 0
     converged = False
     aborted_reason: str | None = None
+    func = ida_funcs.get_func(func_start)
+    if func is None:
+        return {"ok": False, "error": f"No function at {hex(func_start)}"}
+
     prev_signature: tuple[int, int, int] | None = None
 
     for iter_idx in range(1, max_iterations + 1):
-        func = ida_funcs.get_func(func_start) or ida_funcs.get_func(func_start)
+        func = ida_funcs.get_func(func_start) or func
         if func is None:
             aborted_reason = f"function disappeared at {hex(func_start)}"
             break
@@ -1733,6 +1734,7 @@ def deobfuscate_segment(
     `dry_run=True` (default) previews candidates and runs the full analysis
     pipeline without writing patches to the IDB.
     """
+    import idaapi
     import ida_segment
     import idautils
     import ida_funcs
@@ -1750,6 +1752,10 @@ def deobfuscate_segment(
             "ok": False,
             "error": "confirm=True is required when dry_run=False. Set dry_run=True to preview patches.",
         }
+
+    if not segment or not segment.strip():
+        return {"ok": False, "error": "segment name or address is required"}
+    segment = segment.strip()
 
     seg = None
     if segment.lower().startswith("0x"):
@@ -1788,7 +1794,10 @@ def deobfuscate_segment(
             continue
         if exclude_libraries and (func.flags & ida_funcs.FUNC_LIB):
             continue
-        score_info = _compute_obfuscation_score(func_ea)
+        try:
+            score_info = _compute_obfuscation_score(func_ea)
+        except Exception:
+            score_info = None
         if score_info is None:
             continue
         if score_info["obfuscation_score"] < complexity_threshold:
