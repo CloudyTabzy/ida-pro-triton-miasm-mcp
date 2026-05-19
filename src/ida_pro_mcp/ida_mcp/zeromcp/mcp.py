@@ -783,7 +783,16 @@ class McpServer:
             tool_group = self._get_tool_extension(func_name)
             if tool_group and tool_group not in enabled:
                 continue  # Skip tools from disabled extension groups
-            tools.append(self._generate_tool_schema(func_name, func))
+            try:
+                tools.append(self._generate_tool_schema(func_name, func))
+            except Exception as e:
+                logger.warning(
+                    "[MCP] Schema generation failed for tool '%s': %s (%s). "
+                    "Skipping this tool in tools/list.",
+                    func_name,
+                    type(e).__name__,
+                    e,
+                )
         return {"tools": tools}
 
     def _get_tool_extension(self, func_name: str) -> str | None:
@@ -1161,7 +1170,12 @@ class McpServer:
             # Forward reference evaluation failed (often because @functools.wraps
             # changes the evaluation namespace). Fall back to hints without extras
             # so the tool remains discoverable even if Annotated descriptions are lost.
-            hints = get_type_hints(func, include_extras=False)
+            try:
+                hints = get_type_hints(func, include_extras=False)
+            except Exception:
+                hints = dict(getattr(func, '__annotations__', {}))
+        except Exception:
+            hints = dict(getattr(func, '__annotations__', {}))
         return_type = hints.pop("return", None)
         sig = inspect.signature(func)
 

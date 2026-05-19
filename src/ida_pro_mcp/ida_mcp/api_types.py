@@ -2054,12 +2054,6 @@ def _collect_xref_functions(target_ea: int, direction: str, max_depth: int, max_
     return result
 
 
-@tool
-@idasync
-
-
-
-
 class ConstructorFieldEntry(TypedDict, total=False):
     offset: int           # byte offset from this pointer
     access_size: int      # bytes written

@@ -919,11 +919,15 @@ def find_regex(
     }
 
 
-_COMMENT_SCOLORS = (
-    ida_lines.SCOLOR_REGCMT,
-    ida_lines.SCOLOR_RPTCMT,
-    ida_lines.SCOLOR_AUTOCMT,
-    ida_lines.SCOLOR_COLLAPSED,
+_COMMENT_SCOLORS = tuple(
+    c
+    for c in (
+        getattr(ida_lines, "SCOLOR_REGCMT", None),
+        getattr(ida_lines, "SCOLOR_RPTCMT", None),
+        getattr(ida_lines, "SCOLOR_AUTOCMT", None),
+        getattr(ida_lines, "SCOLOR_COLLAPSED", None),
+    )
+    if c is not None
 )
 
 
