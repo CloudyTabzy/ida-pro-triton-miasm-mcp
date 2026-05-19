@@ -6,13 +6,17 @@ Guidance for AI agents and contributors working in this repository.
 
 ## What this project is
 
-**ida-pro-triton-miasm-mcp** is a fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) that extends the IDA Pro MCP server with built-in support for three binary analysis engines:
+**ida-pro-triton-miasm-mcp** is a fork of [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) that extends the IDA Pro MCP server with built-in support for seven optional binary analysis engines:
 
 - **Triton** (`triton-library`) — dynamic symbolic execution, taint analysis, SMT constraint solving
 - **Miasm** (`miasm`) — binary IR lifting, SSA transformation, deobfuscation, cross-architecture assembly
 - **Construct** (`construct`) — declarative binary format parsing, PE/ELF/protocol header extraction, IDA struct bridge
+- **dissect.cstruct** (`dissect.cstruct`) — C-syntax struct/enum parsing and serialization
+- **filetype** (`filetype`) — magic-byte file type identification
+- **LIEF** (`lief`) — binary format analysis (PE/ELF/Mach-O), checksec, Authenticode, Rich Header
+- **YARA** (`yara-python`) — signature-based scanning, built-in crypto/threat rules, IDB annotation
 
-Both engines are **optional built-in modules**, not separate servers. They register their tools through the same `@tool @idasync` machinery as the rest of the IDA API modules. If a library is not installed, its tools are silently absent (except a `*_status` probe tool that always reports availability).
+All engines are **optional built-in modules**, not separate servers. They register their tools through the same `@tool @idasync` machinery as the rest of the IDA API modules. If a library is not installed, its tools are silently absent (except a `*_status` probe tool that always reports availability).
 
 ---
 
@@ -21,7 +25,8 @@ Both engines are **optional built-in modules**, not separate servers. They regis
 1. Give AI agents the full Triton symbolic execution surface inside IDA — no separate MCP, no zeromcp patching, no port juggling.
 2. Give AI agents Miasm's IR lifting, deobfuscation, and assembly capabilities inside IDA — same constraint.
 3. Provide composite cross-engine workflows (`hybrid_*` tools) for obfuscated binary analysis.
-4. Maintain full backward compatibility with the upstream `ida-pro-mcp` API and test suite.
+4. Give AI agents LIEF binary intelligence and YARA signature scanning inside IDA — same constraint.
+5. Maintain full backward compatibility with the upstream `ida-pro-mcp` API and test suite.
 
 ---
 
@@ -71,6 +76,10 @@ ida-pro-triton-miasm-mcp-main/
         ├── api_triton.py            ← [NEW] Triton symbolic execution (optional)
         ├── api_miasm.py             ← [NEW] Miasm IR analysis (optional)
         ├── api_construct.py         ← [NEW] Construct declarative parsing (optional)
+        ├── api_cstruct.py           ← [NEW] C-syntax struct parsing (optional)
+        ├── api_filetype.py          ← [NEW] Magic-byte file type ID (optional)
+        ├── api_lief.py              ← [NEW] LIEF binary analysis (optional)
+        ├── api_yara.py              ← [NEW] YARA signature scanning (optional)
         │
         └── tests/                   ← IDA-side tests (run via ida-mcp-test)
             ├── test_api_core.py
@@ -78,7 +87,9 @@ ida-pro-triton-miasm-mcp-main/
             ├── ... (one file per api_*.py)
             ├── test_api_triton.py   ← [NEW] auto-skip if triton-library absent
             ├── test_api_miasm.py    ← [NEW] auto-skip if miasm absent
-            └── test_api_construct.py ← [NEW] auto-skip if construct absent
+            ├── test_api_construct.py ← [NEW] auto-skip if construct absent
+            ├── test_api_lief.py     ← [NEW] auto-skip if lief absent
+            └── test_api_yara.py     ← [NEW] auto-skip if yara-python absent
 ```
 
 ---
@@ -194,6 +205,59 @@ ida-pro-triton-miasm-mcp-main/
 
 ---
 
+### `api_lief.py` — LIEF Binary Analysis
+
+**Requires:** `pip install lief`
+
+**What it does:** Parses PE, ELF, and Mach-O binaries for metadata, security mitigations, sections, imports, exports, strings, TLS callbacks, digital signatures, and compiler fingerprinting. Also provides binary modification tools (add section, patch import, strip metadata) and composite threat assessment.
+
+**Tool prefix:** `lief_*`
+
+**Key tools:**
+
+| Tool | Description |
+|---|---|
+| `lief_status` | Always available. Reports library presence and version. |
+| `lief_info` | High-level binary metadata (format, arch, entry point, counts). |
+| `lief_checksec` | Security mitigations score (NX, ASLR, CFG, RELRO, canary, etc.). |
+| `lief_sections` | Section table with virtual addresses, sizes, entropy, permissions. |
+| `lief_imports` / `lief_exports` | Import/export directories with addresses and ordinals. |
+| `lief_strings` | Extract ASCII/UTF-16 strings from sections and overlay. |
+| `lief_verify_signature` | Full Authenticode chain verification (native Python, no WinTrust). |
+| `lief_rich_header` | Decode PE Rich Header for compiler fingerprinting and attribution. |
+| `lief_pe_overlay` | Inspect data after the last section (packers, SFX, embedded payloads). |
+| `lief_guard_functions` | Read Windows CFG tables (valid indirect-call targets). |
+| `lief_compare_to_idb` | Cross-reference raw binary against loaded IDB state. |
+| `hybrid_lief_checksec_exploit_assess` | Composite exploit-surface rating (checksec + CFG + signature + overlay). |
+| `hybrid_lief_sync_symbols` | Sync symbol names from LIEF into the IDA database. |
+
+---
+
+### `api_yara.py` — YARA Signature Scanning
+
+**Requires:** `pip install yara-python`
+
+**What it does:** Scans binary data with YARA rules — custom user rules, built-in crypto constant detection, built-in threat indicator rules, and automatic IDB annotation. The `yara_idb_annotate` tool is a killer feature: it scans every function against your rules and writes comments + renames `sub_XXXX` stubs to `yara_<rule_name>`.
+
+**Tool prefix:** `yara_*`
+
+**Key tools:**
+
+| Tool | Description |
+|---|---|
+| `yara_status` | Always available. Reports library presence and built-in rule counts. |
+| `yara_scan` | Scan an IDA range, whole binary, or raw file against custom rules. |
+| `yara_scan_builtin_crypto` | Detect AES S-box, MD5/SHA IVs, CRC32 poly, RC4 KSA — no files needed. |
+| `yara_scan_builtin_threats` | Detect packers, C2 frameworks, hack tools, shellcode patterns. |
+| `yara_generate_rule` | Generate a YARA rule from bytes at an IDA address with pointer wildcarding. |
+| `yara_idb_annotate` | ⭐ Scan all functions, write comments, rename matched stubs — unique to this fork. |
+| `yara_function_classifier` | Per-function category heat map (crypto / packers / c2 / shellcode / custom). |
+| `hybrid_yara_lief_profile` | Composite threat profile: LIEF checksec + YARA scan + section entropy. |
+| `hybrid_yara_triton_verify_crypto` | YARA finds crypto candidates → Triton symbolically verifies actual usage. |
+| `hybrid_yara_miasm_deobfuscate` | YARA detects packer stubs → Miasm lifts and simplifies IR. |
+
+---
+
 ## Adding a new tool (the pattern)
 
 1. Choose the correct module (`api_triton.py`, `api_miasm.py`, or an appropriate existing one).
@@ -306,7 +370,11 @@ uv run idalib-mcp --stdio path/to/binary
 pip install triton-library          # Triton
 pip install miasm                   # Miasm
 pip install construct               # Construct
-pip install 'triton-library miasm construct'  # All
+pip install dissect.cstruct         # C-syntax structs
+pip install filetype                # Magic-byte identification
+pip install lief                    # Binary format analysis
+pip install yara-python             # Signature scanning
+pip install 'triton-library miasm construct dissect.cstruct filetype lief yara-python'  # All
 
 # Run IDA-side tests (headless)
 uv run ida-mcp-test tests/crackme03.elf -q
@@ -422,12 +490,15 @@ Do not add Triton/Miasm/Construct logic to any file that upstream also maintains
 - `api_triton.py`
 - `api_miasm.py`
 - `api_construct.py`
+- `api_lief.py`
+- `api_yara.py`
 - `api_analysis.py`, `api_types.py`, `api_modify.py`, `api_memory.py`
 - `utils.py`, `framework.py`
 
 **Medium:**
 - `api_core.py`, `api_stack.py`, `api_resources.py`
 - `api_survey.py`, `api_composite.py`
+- `api_cstruct.py`, `api_filetype.py`
 
 **Lower:**
 - `api_debug.py`

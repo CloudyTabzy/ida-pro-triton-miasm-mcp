@@ -873,12 +873,22 @@ def find_regex(
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
     search_strings: Annotated[bool, "Search string literals (default: true)"] = True,
     search_names: Annotated[bool, "Search function and symbol names (default: true)"] = True,
+    scan_raw: Annotated[
+        bool,
+        "Also scan raw bytes of data segments for matches not in IDA's string table. "
+        "Useful for encrypted/packed regions or unpacked shellcode where IDA has not "
+        "yet defined string items. Slower; use only when normal string search is empty.",
+    ] = False,
 ) -> FindRegexResult:
     """Search by case-insensitive regex across string literals and symbol names.
 
     By default searches both the string table (literal char* data) and all named
-    symbols (functions, globals, labels). Use search_strings/search_names to narrow
-    the scope. For searching the disassembly listing or comments, use search_text.
+    symbols (functions, globals, labels). Use ``search_strings``/``search_names`` to
+    narrow the scope.
+
+    For searching the **disassembly listing or comments**, use ``search_text`` instead.
+    For searching **raw bytes in data segments** (e.g. decrypted regions where IDA has
+    not created string items), set ``scan_raw=true``.
     """
     if limit <= 0:
         limit = 50
@@ -891,21 +901,60 @@ def find_regex(
         return {"n": 0, "matches": [], "cursor": {"done": True}, "error": f"Invalid regex: {e}"}
 
     # Collect all candidates in a single ordered pass, then paginate.
-    # Each entry: {"addr": hex, "text": str, "kind": "string"|"name"}
+    # Each entry: {"addr": hex, "text": str, "kind": "string"|"name"|"raw"}
     candidates: list[dict] = []
+    seen_addrs: set[str] = set()
 
     if search_strings:
         for ea, text in _get_strings_cache():
             if regex.search(text):
-                candidates.append({"addr": hex(ea), "text": text, "kind": "string"})
+                addr_hex = hex(ea)
+                candidates.append({"addr": addr_hex, "text": text, "kind": "string"})
+                seen_addrs.add(addr_hex)
 
     if search_names:
         for name_ea, name in idautils.Names():
             if name and regex.search(name):
-                candidates.append({"addr": hex(name_ea), "text": name, "kind": "name"})
+                addr_hex = hex(name_ea)
+                if addr_hex not in seen_addrs:
+                    candidates.append({"addr": addr_hex, "text": name, "kind": "name"})
+                    seen_addrs.add(addr_hex)
 
-    # Stable sort: strings first, then names, preserving address order within each kind
-    candidates.sort(key=lambda c: (0 if c["kind"] == "string" else 1, int(c["addr"], 16)))
+    if scan_raw:
+        # Scan data segments for raw byte matches not in the string table
+        _RAW_SCAN_CAP_PER_SEG = 16 * 1024 * 1024  # 16 MiB per segment
+        for seg_ea in idautils.Segments():
+            seg = idaapi.getseg(seg_ea)
+            if not seg or seg.size() < 4:
+                continue
+            try:
+                seg_size = min(int(seg.size()), _RAW_SCAN_CAP_PER_SEG)
+                data = idaapi.get_bytes(seg.start_ea, seg_size)
+                if not data:
+                    continue
+                for m in regex.finditer(data):
+                    match_addr = seg.start_ea + m.start()
+                    addr_hex = hex(match_addr)
+                    if addr_hex in seen_addrs:
+                        continue
+                    match_bytes = data[m.start() : m.end()]
+                    # Best-effort display: try UTF-8, fall back to hex
+                    try:
+                        text = match_bytes.decode("utf-8", errors="replace")
+                    except Exception:
+                        text = match_bytes.hex()
+                    candidates.append({"addr": addr_hex, "text": text, "kind": "raw"})
+                    seen_addrs.add(addr_hex)
+            except Exception:
+                continue
+
+    # Stable sort: strings first, then names, then raw, preserving address order
+    candidates.sort(
+        key=lambda c: (
+            {"string": 0, "name": 1, "raw": 2}.get(c["kind"], 3),
+            int(c["addr"], 16),
+        )
+    )
 
     total = len(candidates)
     page = candidates[offset: offset + limit]

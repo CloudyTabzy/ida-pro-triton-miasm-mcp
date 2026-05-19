@@ -1190,8 +1190,15 @@ def decompile_checked(addr: int):
     return cfunc
 
 
-def decompile_function_safe(ea: int, include_addresses: bool = True) -> Optional[str]:
-    """Safely decompile a function, returning None on failure (uses cache)"""
+def decompile_function_safe(ea: int, include_addresses: bool = True, max_lines: int = 0) -> Optional[str]:
+    """Safely decompile a function, returning None on failure (uses cache).
+
+    Args:
+        ea: Function address.
+        include_addresses: Append /*0xNNNN*/ markers per line.
+        max_lines: If > 0, truncate pseudocode at this many lines and append
+                   a "... (N more lines)" note.
+    """
     import ida_lines
     import ida_kernwin
 
@@ -1203,7 +1210,12 @@ def decompile_function_safe(ea: int, include_addresses: bool = True) -> Optional
             return None
         sv = cfunc.get_pseudocode()
         lines = []
-        for sl in sv:
+        total_lines = len(sv)
+        for idx, sl in enumerate(sv):
+            if max_lines > 0 and idx >= max_lines:
+                omitted = total_lines - max_lines
+                lines.append(f"\n// ... ({omitted} more line{'s' if omitted != 1 else ''}) ...")
+                break
             sl: ida_kernwin.simpleline_t
             _head = ida_hexrays.ctree_item_t()
             item = ida_hexrays.ctree_item_t()

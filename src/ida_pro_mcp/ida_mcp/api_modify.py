@@ -838,17 +838,23 @@ def _diagnose_add_func_failure(start_ea: int, end_ea: int) -> str:
         parts.append(f"segment '{seg_name}' is typed as BSS")
     flags = idc.get_full_flags(start_ea)
     if idc.is_unknown(flags):
-        parts.append("bytes are undefined (try force=True to run analysis first)")
+        parts.append("bytes are undefined")
     elif idc.is_data(flags):
-        parts.append("bytes are currently typed as data (try force=True with del_items=True)")
+        parts.append("bytes are currently typed as data")
     overlap = idaapi.get_func(start_ea)
     if overlap:
         parts.append(
             f"overlaps existing function {hex(overlap.start_ea)}–{hex(overlap.end_ea)}"
         )
     if not parts:
-        parts.append("IDA declined to create the function (bounds may be ambiguous; supply end=)")
-    return "; ".join(parts)
+        parts.append("IDA declined to create the function (bounds may be ambiguous)")
+    hint = "; ".join(parts)
+    # Append explicit JSON example so LLMs know the exact fix
+    example = (
+        f'Retry with: {{"addr":"{hex(start_ea)}","end":"<exclusive_end>",'
+        f'"force":true}} — or add "del_items":true if bytes are misidentified as data'
+    )
+    return f"{hint}. {example}"
 
 
 @tool

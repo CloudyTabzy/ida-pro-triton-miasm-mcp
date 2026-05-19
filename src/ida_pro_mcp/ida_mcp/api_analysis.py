@@ -63,6 +63,7 @@ class DecompileResult(TypedDict):
     code: str | None
     refs: NotRequired[list[Ref]]
     warnings: NotRequired[list[DecompileWarning]]
+    truncated: NotRequired[bool]
     error: NotRequired[str]
     error_type: NotRequired[str]
     hint: NotRequired[str]
@@ -789,6 +790,12 @@ def decompile(
     include_addresses: Annotated[
         bool, "Append /*0xNNNN*/ markers per line (default: true). Set false to save tokens."
     ] = True,
+    max_pseudocode_lines: Annotated[
+        int,
+        "Truncate pseudocode at N lines (default: 0 = unlimited). "
+        "Useful for very large functions where full output floods context. "
+        "A /* ... (N more lines) ... */ note is appended when truncated.",
+    ] = 0,
 ) -> DecompileResult:
     """Decompile function(s) at address(es); returns pseudocode and per-item errors.
 
@@ -798,10 +805,14 @@ def decompile(
 
     On failure, ``error`` contains the structured Hex-Rays failure description
     rather than the generic "Decompilation failed" string.
+
+    Use ``max_pseudocode_lines`` to limit output size for very large functions.
     """
     try:
         start = parse_address(addr)
-        code = decompile_function_safe(start, include_addresses=include_addresses)
+        code = decompile_function_safe(
+            start, include_addresses=include_addresses, max_lines=max_pseudocode_lines
+        )
         if code is None:
             decompile_error = "Decompilation failed"
             try:
@@ -819,6 +830,8 @@ def decompile(
             return {"addr": addr, "code": None, "error": decompile_error}
 
         result: DecompileResult = {"addr": addr, "code": code}
+        if max_pseudocode_lines > 0 and "// ... (" in code and " more line" in code:
+            result["truncated"] = True
         try:
             import ida_hexrays as _hr
 

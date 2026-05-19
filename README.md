@@ -1,6 +1,6 @@
 # IDA Pro Binary Analysis MCP
 
-> **One MCP server. Six analysis engines. 140+ tools. Zero configuration overhead.**
+> **One MCP server. Seven analysis engines. 140+ tools. Zero configuration overhead.**
 
 Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, PE Authenticode verification, Rich Header compiler fingerprinting, CFG guard analysis, and cross-engine hybrid workflows, all through a single MCP server.
 
@@ -12,7 +12,8 @@ Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — s
 | 📝 C-Syntax Structs (dissect.cstruct) | `pip install dissect.cstruct` | 7 |
 | 🪄 Magic-Byte Identification (filetype) | `pip install filetype` | 4 |
 | 🔍 LIEF Binary Analysis | `pip install lief` | 19 |
-| 🎯 Native IDA (core + recon + hybrid) | Built-in | 60+ |
+| 🎯 YARA Signature Scanning | `pip install yara-python` | 15+ |
+| 🛡️ Native IDA (core + recon + hybrid) | Built-in | 60+ |
 
 **All engines are optional.** The plugin runs without any of them; install only what you need.
 
@@ -40,6 +41,8 @@ Install optional analysis engines? (space=toggle, enter=confirm):
 [✓] Construct — declarative binary format parsing
 [✓] cstruct   — C-syntax struct/enum parsing
 [✓] filetype  — magic-byte file type identification
+[✓] lief      — binary format analysis, checksec, signatures
+[✓] yara      — signature scanning, threat detection, IDB annotation
 ```
 
 ### Manual Install
@@ -58,6 +61,7 @@ construct_status   → {"ok": true, "available": true, ...}
 cstruct_status     → {"ok": true, "available": true, ...}
 filetype_status    → {"ok": true, "available": true, ...}
 lief_status        → {"ok": true, "available": true, "version": "0.17.x", ...}
+yara_status        → {"ok": true, "available": true, ...}
 ```
 
 ---
@@ -89,6 +93,7 @@ flowchart TB
         K[dissect.cstruct<br/>C Syntax]
         L[filetype<br/>Magic Bytes]
         M[LIEF<br/>Binary Analysis]
+        N[YARA<br/>Signature Scanning]
     end
 
     A --> B
@@ -103,6 +108,7 @@ flowchart TB
     F -.-> K
     F -.-> L
     F -.-> M
+    F -.-> N
 ```
 
 **Execution modes:**
