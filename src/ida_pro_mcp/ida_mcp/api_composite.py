@@ -1356,24 +1356,29 @@ def _is_jmp_only_irblock(irblock, lifter) -> bool:
     return False
 
 
-def _identify_dead_candidates(asmcfg, ircfg, lifter) -> list[HybridPatchCandidate]:
+def _identify_dead_candidates(
+    asmcfg, ircfg, lifter, func_start: int = 0
+) -> list[HybridPatchCandidate]:
     """Return asmcfg blocks that are safe to NOP out after simplification.
 
-    Two conservative signals used (the Triton verification pass acts as the
-    outer safety net for any false positives):
+    Three signals used (the Triton verification pass acts as the outer safety
+    net for any false positives, especially for merged blocks):
 
     1. irblock is empty (len == 0) — all assignments dead, block is unreachable.
     2. irblock is a bare unconditional jump to a constant (jmp-only) — the sole
        remaining artifact of an opaque predicate that simplified to a constant
        branch; the original assembly for this block is dead.
-
-    Blocks merged into their predecessor by merge_blocks (live sequential code)
-    are NOT flagged here because they retain real assignments in the merged block.
+    3. Block exists in asmcfg but was REMOVED from the IRCFG entirely — this
+       happens when merge_blocks merges sequential blocks or when a block
+       becomes unreachable after simplification. The original assembly bytes
+       are no longer needed by the simplified IR.
     """
     from .api_miasm import _iter_ircfg_blocks
 
+    ircfg_loc_keys: set = set()
     dead_loc_keys: set = set()
     for loc_key, irblock in _iter_ircfg_blocks(ircfg):
+        ircfg_loc_keys.add(loc_key)
         if len(irblock) == 0 or _is_jmp_only_irblock(irblock, lifter):
             dead_loc_keys.add(loc_key)
 
@@ -1381,13 +1386,29 @@ def _identify_dead_candidates(asmcfg, ircfg, lifter) -> list[HybridPatchCandidat
     for block in asmcfg.blocks:
         if not block.lines:
             continue
-        if block.loc_key not in dead_loc_keys:
-            continue
+
         start = block.lines[0].offset
+        # Never patch the function entry block — it would destroy the function.
+        if func_start and start == func_start:
+            continue
+
         last = block.lines[-1]
         end = last.offset + last.l
         size = end - start
         if size <= 0:
+            continue
+
+        # Signal 3: block was removed from IRCFG (merged or unreachable)
+        if block.loc_key not in ircfg_loc_keys:
+            candidates.append({
+                "address": hex(start),
+                "size": size,
+                "reason": "Block removed from IRCFG (merged or unreachable)",
+            })
+            continue
+
+        # Signals 1 & 2: block is empty or jump-only in IRCFG
+        if block.loc_key not in dead_loc_keys:
             continue
         candidates.append({
             "address": hex(start),
@@ -1518,7 +1539,7 @@ def _hybrid_iterative_deobfuscate_core(
         edge_count_final = edge_count_after
         ir_stmt_final = ir_stmt_after
 
-        candidates = _identify_dead_candidates(asmcfg, ircfg, lifter)
+        candidates = _identify_dead_candidates(asmcfg, ircfg, lifter, func.start_ea)
 
         signature = (block_count_final, ir_stmt_final, edge_count_final)
 

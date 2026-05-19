@@ -551,6 +551,8 @@ Do not add Triton/Miasm/Construct logic to any file that upstream also maintains
 - **`exclude_libraries=True` (default)** skips functions marked `FUNC_LIB`. If a packer/obfuscator has already been partially identified by FLIRT, its stubs may be marked library and skipped — disable this if you want to target them.
 - **Per-function error isolation:** One candidate failing does not abort the batch. After 10 consecutive failures the batch aborts early with `aborted_early=True` to avoid spinning on systemic corruption or architecture mismatch.
 - **`_hybrid_iterative_deobfuscate_core`** is the same pipeline as `hybrid_iterative_deobfuscate` (convergence on block/edge/IR-stmt signature, optional Triton verification, NOP patching). The batch tool simply calls it in a loop.
+- **Patch candidates come from three signals:** (1) empty IR block, (2) bare unconditional jump-only IR block, (3) block removed from IRCFG entirely (merged by `merge_blocks` or became unreachable). The function entry block is never patched. Triton verification is the safety net for signal-3 candidates (merged blocks may not be memory-adjacent to their predecessor, so NOPing them could change fall-through behavior).
+- **All-or-nothing Triton verification:** If `verify_with_triton=True` and ANY candidate causes a register mismatch, ALL patches for that function are skipped. Set `verify_with_triton=False` if you want to apply patches without verification (review dry_run output first).
 
 ---
 
