@@ -1,8 +1,8 @@
 # Synapse MCP
 
-> **One MCP server. Eight analysis engines. 180+ tools. Zero configuration overhead.**
+> **One MCP server. Nine analysis engines. 180+ tools. Zero configuration overhead.**
 
-Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, PE Authenticode verification, Rich Header compiler fingerprinting, CFG guard analysis, and cross-engine hybrid workflows, all through a single MCP server.
+Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — symbolic execution, IR lifting, deobfuscation, declarative format parsing, stripped-binary reconnaissance, graph-theoretic analysis, PE Authenticode verification, Rich Header compiler fingerprinting, CFG guard analysis, and cross-engine hybrid workflows, all through a single MCP server.
 
 | Engine | Status | Tools |
 |--------|--------|-------|
@@ -18,6 +18,30 @@ Turn IDA Pro into a comprehensive binary analysis powerhouse for AI agents — s
 | 🛡️ Native IDA (core + recon + hybrid) | Built-in | 60+ |
 
 **All engines are optional.** The plugin runs without any of them; install only what you need.
+
+---
+
+## 🦥 Lazy Mode — 95% Less Context, Same Power
+
+AI agents have a dirty secret: every MCP session starts by loading **all 180+ tool schemas** into context. That's 24,000–48,000 tokens burned before a single analysis step. For agents with 64K or 128K context windows, this leaves almost no room for the actual work — decompilation, symbolic execution, cross-references.
+
+**Lazy mode fixes this.** Start the server with `--lazy` and `tools/list` returns only **4 meta-tools**:
+
+| Meta-Tool | What it does |
+|-----------|-------------|
+| `list_modules` | Discover 6 semantic groups (`core`, `analysis`, `modify`, `symbolic`, `formats`, `recon`) |
+| `list_tools(module=...)` | Paginated discovery inside any group |
+| `describe_tool(name)` | Load the full schema for one tool on demand |
+| `invoke_tool(tool, args)` | Execute any tool by name |
+
+The agent pays only **~800 tokens** at session start. When it needs Triton, it asks for the `symbolic` group. When it needs to rename a function, it asks for `modify`. Schemas are fetched just-in-time and cached automatically. If IDA reloads a new binary mid-session, the cache self-invalidates and retries transparently.
+
+```bash
+ida-pro-mcp --lazy          # GUI plugin mode
+idalib-mcp --stdio --lazy   # Headless mode
+```
+
+Lazy mode is the default we recommend for Claude, Roo, Cursor, and any client where context is precious. For agents with very large windows (200K+), run without `--lazy` to get all tools upfront.
 
 ---
 
@@ -694,44 +718,6 @@ _Note:_ Headless `idalib-mcp` requires [idalib](https://docs.hex-rays.com/core/i
 
 ---
 
-## 💡 Prompt Engineering Tips
-
-### Minimal crackme prompt
-```md
-Your task is to analyze a crackme in IDA Pro using the MCP tools.
-
-Strategy:
-- Inspect decompilation and add comments with findings
-- Rename variables and functions to sensible names
-- Correct pointer/array types where necessary
-- Disassemble for low-level details when needed
-- NEVER convert number bases yourself — use `int_convert`
-- Do not brute force; derive solutions from analysis
-- Create a report.md with findings
-```
-
-### Comprehensive RE prompt (by [@can1357](https://github.com/can1357))
-```md
-Your task is to create a complete reverse engineering analysis.
-
-1. **Decompilation Analysis** — inspect thoroughly, add comments
-2. **Improve Readability** — rename vars/functions, fix types
-3. **Deep Dive** — disassemble when needed, document low-level behavior
-4. **Constraints** — use `int_convert`, derive conclusions from evidence
-5. **Documentation** — produce comprehensive RE/*.md files
-```
-
-### Obfuscated binary workflow
-```md
-For obfuscated binaries, follow this sequence:
-1. hybrid_iterative_deobfuscate(dry_run=True) → see dead blocks
-2. hybrid_iterative_deobfuscate(dry_run=False, confirm=True) → apply NOPs
-3. hybrid_analyze_function(symbolize_args=True) → symbolic report
-4. miasm_solve_path_constraints → find inputs reaching target blocks
-```
-
----
-
 ## 🛠️ Development
 
 Adding a new tool is one function in `src/ida_pro_mcp/ida_mcp/api_*.py`:
@@ -776,29 +762,21 @@ uv run coverage report --show-missing
 
 The project is actively evolving. Here's what's on the horizon:
 
-### Phase 4 — Surgical Analysis & Workflow Automation *(in progress)*
+### Phase 4 — Surgical Analysis & Workflow Automation ✅ *(complete)*
 
-**Smarter recovery from stripped binaries.** After FLIRT signatures run, the plugin will auto-suggest names for the remaining unnamed functions by scoring prologue matches, cross-reference patterns, and structural similarity — turning hours of manual triage into a ranked candidate list.
+Stripped-binary recovery with FLIRT + prologue scoring, type propagation from malloc traces, batch segment-level deobfuscation, and multi-hop data-flow tracing across function boundaries.
 
-**Type propagation chains.** Starting from a single `malloc` call, the engine will trace forward through field writes and pointer assignments to auto-infer complete struct layouts — no more guessing what lives at offset `0x18`.
+### Phase 5–6 — Scientific Computing & Graph-Theoretic RE 🚧 *(in progress)*
 
-**Batch deobfuscation.** Instead of cleaning one function at a time, point the tool at an entire segment (`.text`, `.itext`) and let it automatically identify obfuscated functions, run iterative Miasm simplification, and NOP out dead code — converging on clean assembly without manual intervention.
+We prioritized **Angr** (symbolic path exploration, stdin modeling, crackme solving) and **NetworkX** (PageRank centrality, community detection, call-graph metrics) because they unlock immediate value for AI agents navigating large binaries.
 
-**Multi-hop xref archaeology.** Trace data flow across function boundaries, through call chains, and into global variables. Follow a tainted register from `main` all the way to the `recv` call that populates it — hop by hop, with full edge classification.
+**Already integrated:** Construct, LIEF, YARA, cstruct, filetype, Angr, NetworkX.
 
-### Phase 5 — Scientific Computing & Advanced Binary Intelligence *(planned)*
+**Next up:** Numpy-powered entropy heatmaps and byte-histogram similarity for clone detection — followed by SciPy signal processing for spotting periodic crypto constants in raw binary data.
 
-**Entropy heatmaps.** Visualize which regions of a binary are encrypted, compressed, or plaintext — computed numerically across the entire image, not just the sections IDA knows about.
+### Phase 7 — Deep Analysis Engines *(planned)*
 
-**Graph-theoretic RE.** Run PageRank on the call graph to find the "most important" functions. Use community detection to auto-partition a malware binary into its crypto, networking, and anti-analysis modules. Find critical bridges whose removal would disconnect entire subsystems.
-
-**Signal processing for crypto detection.** Apply FFT and spectral analysis to binary data to detect periodic patterns — AES S-box tables, repeated XOR keys, and encoded C2 domains reveal themselves as frequency spikes.
-
-**YARA signature scanning.** Built-in rules for malware families (Cobalt Strike, Metasploit, Mimikatz), crypto constants, and packer stubs — scan the entire binary in milliseconds without writing a single rule.
-
-**Binary format surgery.** ✅ *Complete — see `lief_*` tools.* Add sections, patch imports, rebuild headers, strip metadata, verify Authenticode, decode Rich Headers, enumerate CFG guard targets, and diff raw-file state against the IDA database.
-
-**Exploit primitives.** Generate cross-architecture shellcode, build cyclic De Bruijn patterns for offset calculation, enumerate ROP gadgets, and pack/unpack integers with configurable endianness — directly inside the IDA context.
+For hostile, encrypted, and VM-obfuscated binaries that IDA alone cannot crack: Capstone/Keystone for independent disassembly and assembly outside IDA's state, Unicorn for concrete CPU emulation of decrypt stubs and VM interpreters, and standalone Z3 SMT solving without Triton dependency. These engines close the gap between static analysis and runtime behavior — letting agents decrypt code, emulate packers, and reason about obfuscated control flow without manual intervention.
 
 ---
 
@@ -824,8 +802,9 @@ The following optional analysis engines are **not** bundled with this project. T
 | filetype | `filetype` | [MIT](https://github.com/h2non/filetype.py) | |
 | LIEF | `lief` | [Apache-2.0](https://github.com/lief-project/LIEF/blob/main/LICENSE) (standard tier); commercial for LIEF Extended | |
 | YARA | `yara-python` | [Apache-2.0](https://github.com/VirusTotal/yara-python) | |
+| NetworkX | `networkx` | [BSD-3-Clause](https://github.com/networkx/networkx/blob/main/LICENSE) | Pure Python; small footprint |
 
-**Transitive dependencies of note:**
+**Transitive dependencies of note:
 
 | Package | License | Why it matters |
 |---------|---------|---------------|
