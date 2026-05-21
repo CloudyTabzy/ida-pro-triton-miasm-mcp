@@ -14,8 +14,8 @@ Main pieces:
 - `src/ida_pro_mcp/installer.py`: MCP client config generation and plugin installation
 
 Core API modules (upstream + enhanced):
-- `api_core.py`: IDB metadata, functions, strings, imports, exports, entity queries
-- `api_analysis.py`: decompilation, disassembly, xrefs, call graphs, basic blocks, instruction queries, function profiling; `decompile_batch` for scanning many functions in one call
+- `api_core.py`: IDB metadata, functions, strings, imports, exports, entity queries; `list_functions_enhanced` (is_thunk/is_library/is_noret/has_prototype/is_external flags); `list_classes` (C++ namespace/class inventory from mangled names)
+- `api_analysis.py`: decompilation, disassembly, xrefs, call graphs, basic blocks, instruction queries, function profiling; `decompile_batch`; `get_function_callers` / `callees` for bidirectional caller-callee lookup; `get_function_signature` (IDB type + Hex-Rays fallback); `get_function_jump_targets` (control-flow triage without full CFG); `get_function_hash` + `get_bulk_function_hashes` (SHA-256 of normalised opcodes — stable across rebase, useful for cross-binary matching); `analyze_function_completeness` + `batch_analyze_completeness` (0–100 documentation score: custom name, type, comment, named stack vars, inline comments); `diff_functions` (unified diff of two decompiled functions with similarity score)
 - `api_memory.py`: bytes/ints/strings read and patch, typed integer I/O
 - `api_types.py`: structs, type inference, type application, enum management, constructor analysis (`analyze_constructor` — extracts field layout from `*(this+N)=value` patterns, detects vtable pointer writes, memset/memcpy zero-regions, and delegating constructor calls)
 - `api_modify.py`: comments, renaming, asm patching, function definition, forced range analysis (`analyze_range`), bulk function creation (`scan_and_define_funcs`), user xref creation (`add_xref`)

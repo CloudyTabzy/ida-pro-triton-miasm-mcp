@@ -18,6 +18,7 @@ import idautils
 import ida_loader
 import ida_nalt
 import ida_typeinf
+import ida_name
 import idc
 
 import json
@@ -38,6 +39,7 @@ from .utils import (
     Page,
     ImportQuery,
     get_function,
+    get_prototype,
     normalize_dict_list,
     normalize_list_input,
     parse_address,
@@ -644,6 +646,153 @@ def list_funcs(
         results.append(paginate(filtered, offset, count))
 
     return results
+
+
+@tool
+@idasync
+def list_functions_enhanced(
+    filter: Annotated[str, "Glob filter on function name (empty = all)"] = "",
+    offset: Annotated[int, "Start index for pagination (default: 0)"] = 0,
+    count: Annotated[int, "Max functions to return (default: 100, 0 = all)"] = 100,
+    include_prototype: Annotated[
+        bool,
+        "Include type/prototype string per function. Slower — skips IDB-untyped functions.",
+    ] = False,
+) -> dict:
+    """List functions with extended classification flags.
+
+    Returns ``is_thunk``, ``is_library``, ``is_noret``, ``has_prototype``, and
+    ``is_external`` per function — flags that ``list_funcs`` omits.  Aggregate
+    counts in the top-level result let you gauge annotation coverage at a glance.
+
+    Profile: core
+    """
+    try:
+        all_items: list[dict] = []
+        for start_ea in idautils.Functions():
+            fn = idaapi.get_func(start_ea)
+            if not fn:
+                continue
+            flags = fn.flags
+            name = ida_funcs.get_func_name(start_ea) or f"sub_{start_ea:X}"
+            has_type = bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), start_ea))
+            item: dict = {
+                "addr": hex(start_ea),
+                "name": name,
+                "size": hex(fn.end_ea - start_ea),
+                "is_thunk": bool(flags & ida_funcs.FUNC_THUNK),
+                "is_library": bool(flags & ida_funcs.FUNC_LIB),
+                "is_noret": bool(flags & ida_funcs.FUNC_NORET),
+                "has_prototype": has_type,
+                "is_external": False,
+            }
+            try:
+                seg = idaapi.getseg(start_ea)
+                if seg and (
+                    seg.type == idaapi.SEG_XTRN
+                    or any(
+                        n in (idc.get_segm_name(start_ea) or "").lower()
+                        for n in (".plt", ".idata", "__stubs", "extern")
+                    )
+                ):
+                    item["is_external"] = True
+            except Exception:
+                pass
+            if include_prototype:
+                item["prototype"] = get_prototype(fn) if has_type else None
+            all_items.append(item)
+
+        filtered = pattern_filter(all_items, filter, "name") if filter and filter not in ("*", "") else all_items
+        page = paginate(filtered, offset, count if count > 0 else len(filtered))
+        return {
+            "ok": True,
+            **page,
+            "total_functions": len(filtered),
+            "thunk_count": sum(1 for r in all_items if r.get("is_thunk")),
+            "library_count": sum(1 for r in all_items if r.get("is_library")),
+            "noret_count": sum(1 for r in all_items if r.get("is_noret")),
+            "typed_count": sum(1 for r in all_items if r.get("has_prototype")),
+            "external_count": sum(1 for r in all_items if r.get("is_external")),
+        }
+    except Exception as e:
+        return tool_error(e, context="list_functions_enhanced")
+
+
+@tool
+@idasync
+def list_classes(
+    filter: Annotated[str, "Glob filter on class/namespace name (empty = all)"] = "",
+    offset: Annotated[int, "Start index (default: 0)"] = 0,
+    count: Annotated[int, "Max classes to return (default: 100, 0 = all)"] = 100,
+    min_methods: Annotated[int, "Minimum method count to include a class (default: 1)"] = 1,
+    include_methods: Annotated[
+        bool, "Include per-class method list (default: True)"
+    ] = True,
+) -> dict:
+    """Extract class and namespace names from IDB symbols.
+
+    Scans all named addresses for C++ mangling patterns (``::`` separator,
+    ``_ZN``/``??`` prefixes) and groups methods by their class prefix.  Works
+    on any binary where RTTI, PDB symbols, or user renaming has introduced
+    ``ClassName::method`` style names.
+
+    Profile: core
+    """
+    try:
+        class_map: dict[str, list[dict]] = {}
+        for ea, raw_name in idautils.Names():
+            if not raw_name:
+                continue
+            demangled = (
+                ida_name.demangle_name(raw_name, ida_name.MNG_LONG_FORM) or raw_name
+            )
+            if "::" not in demangled:
+                continue
+            # Strip argument list to get the "ReturnType Class::method" prefix
+            name_part = demangled.split("(")[0].rstrip()
+            last_sep = name_part.rfind("::")
+            if last_sep < 0:
+                continue
+            raw_class = name_part[:last_sep].strip()
+            method_short = name_part[last_sep + 2:].strip()
+            # Strip leading return-type words (e.g. "int" in "int ClassName")
+            ws = raw_class.rfind(" ")
+            class_name = raw_class[ws + 1:] if ws >= 0 else raw_class
+            if not class_name or not method_short:
+                continue
+            entry = {
+                "addr": hex(ea),
+                "name": demangled,
+                "short_name": method_short,
+            }
+            class_map.setdefault(class_name, []).append(entry)
+
+        classes: list[dict] = []
+        for cls_name, methods in sorted(class_map.items(), key=lambda x: x[0].lower()):
+            if len(methods) < min_methods:
+                continue
+            rec: dict = {
+                "class_name": cls_name,
+                "method_count": len(methods),
+            }
+            if include_methods:
+                rec["methods"] = sorted(methods, key=lambda m: m["short_name"])
+            classes.append(rec)
+
+        filtered_cls = (
+            pattern_filter(classes, filter, "class_name")
+            if filter and filter not in ("*", "")
+            else classes
+        )
+        total = len(filtered_cls)
+        page = paginate(filtered_cls, offset, count if count > 0 else total)
+        return {
+            "ok": True,
+            **page,
+            "total_classes": total,
+        }
+    except Exception as e:
+        return tool_error(e, context="list_classes")
 
 
 @tool

@@ -1,5 +1,8 @@
+import difflib
+import hashlib
 import heapq
 from itertools import islice
+import re as _re
 import struct
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
 import ida_lines
@@ -227,6 +230,108 @@ class CalleesResult(TypedDict, total=False):
     error: str
     error_type: str
     hint: str
+
+
+class FunctionCallersItem(TypedDict):
+    func_addr: str
+    func_name: str
+    call_ea: str
+
+
+class FunctionCallersResult(TypedDict, total=False):
+    addr: str
+    name: str
+    callers: list[FunctionCallersItem] | None
+    caller_count: int
+    more: bool
+    error: str
+    error_type: str
+    hint: str
+
+
+class FunctionSignatureResult(TypedDict, total=False):
+    addr: str
+    name: str
+    signature: str | None
+    has_type: bool
+    source: str
+    error: str
+    error_type: str
+
+
+class JumpTargetItem(TypedDict, total=False):
+    ea: str
+    target: str | None
+    kind: str
+    mnemonic: str
+
+
+class JumpTargetsResult(TypedDict, total=False):
+    addr: str
+    name: str
+    jump_count: int
+    jumps: list[JumpTargetItem]
+    error: str
+    error_type: str
+
+
+class FunctionHashResult(TypedDict, total=False):
+    addr: str
+    name: str
+    hash: str
+    normalized_bytes: int
+    instruction_count: int
+    error: str
+    error_type: str
+
+
+class BulkHashPage(TypedDict, total=False):
+    data: list[FunctionHashResult]
+    total: int
+    next_offset: int | None
+    error: str
+    error_type: str
+
+
+class CompletenessResult(TypedDict, total=False):
+    addr: str
+    name: str
+    score: int
+    grade: str
+    has_custom_name: bool
+    has_type: bool
+    has_func_comment: bool
+    has_named_stack_vars: bool
+    has_inline_comments: bool
+    missing: list[str]
+    error: str
+    error_type: str
+
+
+class BatchCompletenessResult(TypedDict, total=False):
+    data: list[CompletenessResult]
+    total: int
+    next_offset: int | None
+    mean_score: float
+    grade_counts: dict[str, int]
+    error: str
+    error_type: str
+
+
+class DiffFunctionsResult(TypedDict, total=False):
+    ok: bool
+    addr_a: str
+    addr_b: str
+    name_a: str
+    name_b: str
+    similarity: float
+    diff: str
+    diff_line_count: int
+    lines_a: int
+    lines_b: int
+    note: str
+    error: str
+    error_type: str
 
 
 class FindBytesResult(TypedDict, total=False):
@@ -1790,6 +1895,725 @@ def callees(
             results.append({"addr": fn_addr, "callees": None, **item_error(e, f"get callees of {fn_addr}")})
 
     return results
+
+
+# ============================================================================
+# Function Analysis — Callers / Signature / Jumps / Hash / Completeness / Diff
+# ============================================================================
+
+# Operand types that carry address/displacement data — these bytes are masked
+# to zero when computing the normalised function hash so the hash stays stable
+# across rebased or relocated binaries.
+_ADDR_OP_TYPES: frozenset[int] = frozenset(
+    {idaapi.o_near, idaapi.o_far, idaapi.o_mem, idaapi.o_displ}
+)
+
+# Auto-generated name patterns that indicate a function has NOT been renamed.
+_AUTO_NAME_RE = _re.compile(
+    r"^(sub|loc|j|nullsub|fn|unk|byte|word|dword|qword|off|seg|asc|str)_[0-9A-Fa-f]+$",
+    _re.IGNORECASE,
+)
+
+
+def _hash_function_bytes(start_ea: int) -> tuple[str, int, int]:
+    """Return (sha256_hex, normalised_byte_count, instruction_count).
+
+    Each instruction's address-type operand bytes are zeroed before hashing so
+    the result is stable across ASLR / rebase.  Immediate constants (algorithm
+    magic numbers) are kept as-is so two identical algorithms still collide.
+    """
+    normalized: list[bytes] = []
+    insn_count = 0
+    for item_ea in idautils.FuncItems(start_ea):
+        insn = idaapi.insn_t()
+        length = idaapi.decode_insn(insn, item_ea)
+        if length <= 0:
+            continue
+        raw = idaapi.get_bytes(item_ea, length)
+        if not raw:
+            continue
+        raw_arr = bytearray(raw)
+        # Find earliest operand byte offset carrying an address value
+        mask_from = length
+        for op in insn.ops:
+            if op.type == idaapi.o_void:
+                break
+            if op.type in _ADDR_OP_TYPES and 0 < op.offb < mask_from:
+                mask_from = op.offb
+        for k in range(mask_from, length):
+            raw_arr[k] = 0
+        normalized.append(bytes(raw_arr))
+        insn_count += 1
+    combined = b"".join(normalized)
+    return hashlib.sha256(combined).hexdigest(), len(combined), insn_count
+
+
+def _score_function_completeness(start_ea: int) -> CompletenessResult:
+    """Return a CompletenessResult dict for a single function."""
+    import ida_struct
+
+    fn = idaapi.get_func(start_ea)
+    if not fn:
+        raise ValueError(f"No function at {hex(start_ea)}")
+    name = ida_funcs.get_func_name(start_ea) or f"sub_{start_ea:X}"
+
+    has_custom_name = not bool(_AUTO_NAME_RE.match(name))
+    has_type = bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), start_ea))
+
+    func_cmt = (idc.get_func_cmt(start_ea, False) or "").strip() or (
+        idc.get_func_cmt(start_ea, True) or ""
+    ).strip()
+    has_func_comment = bool(func_cmt)
+
+    has_named_stack_vars = False
+    try:
+        frame_id = idc.get_frame_id(start_ea)
+        if frame_id and frame_id != idaapi.BADADDR:
+            frame = ida_struct.get_struc(frame_id)
+            if frame:
+                for idx in range(frame.memqty):
+                    member = frame.get_member(idx)
+                    if member:
+                        mname = ida_struct.get_member_name(member.id) or ""
+                        if mname and not _re.match(
+                            r"^(var_|arg_|a\d+)[0-9A-Fa-f]*$", mname, _re.I
+                        ):
+                            has_named_stack_vars = True
+                            break
+    except Exception:
+        pass
+
+    has_inline_comments = False
+    try:
+        for item_ea in idautils.FuncItems(start_ea):
+            if idaapi.get_cmt(item_ea, False) or idaapi.get_cmt(item_ea, True):
+                has_inline_comments = True
+                break
+    except Exception:
+        pass
+
+    score = (
+        (35 if has_custom_name else 0)
+        + (25 if has_type else 0)
+        + (20 if has_func_comment else 0)
+        + (15 if has_named_stack_vars else 0)
+        + (5 if has_inline_comments else 0)
+    )
+    grade = (
+        "A" if score >= 90
+        else "B" if score >= 70
+        else "C" if score >= 40
+        else "D" if score >= 20
+        else "F"
+    )
+    missing = [
+        label
+        for flag, label in (
+            (has_custom_name, "custom_name"),
+            (has_type, "type_annotation"),
+            (has_func_comment, "function_comment"),
+            (has_named_stack_vars, "named_stack_vars"),
+            (has_inline_comments, "inline_comments"),
+        )
+        if not flag
+    ]
+    return {
+        "addr": hex(start_ea),
+        "name": name,
+        "score": score,
+        "grade": grade,
+        "has_custom_name": has_custom_name,
+        "has_type": has_type,
+        "has_func_comment": has_func_comment,
+        "has_named_stack_vars": has_named_stack_vars,
+        "has_inline_comments": has_inline_comments,
+        "missing": missing,
+    }
+
+
+@tool
+@idasync
+def get_function_callers(
+    addrs: Annotated[
+        list[str] | str,
+        "Function addresses or names (e.g. '0x401000', 'check_password')",
+    ],
+    limit: Annotated[int, "Max callers per function (default: 200, max: 500)"] = 200,
+) -> list[FunctionCallersResult]:
+    """Return unique callers for each function, capped by limit.
+
+    Each entry includes the containing caller function's address/name **and**
+    the specific call-site address so you can jump directly to the call
+    instruction.  Complements ``callees`` — together they give the full
+    caller/callee relationship for a function.
+
+    Profile: analysis
+    """
+    addrs = normalize_list_input(addrs)
+    if limit <= 0 or limit > 500:
+        limit = 500
+
+    results: list[FunctionCallersResult] = []
+    for fn_addr in addrs:
+        try:
+            start_ea = parse_address(fn_addr)
+            func = idaapi.get_func(start_ea)
+            if not func:
+                results.append(
+                    {
+                        "addr": fn_addr,
+                        "callers": None,
+                        **item_error(
+                            ValueError("No function at address"),
+                            f"get_function_callers {fn_addr}",
+                        ),
+                    }
+                )
+                continue
+
+            seen: dict[int, FunctionCallersItem] = {}
+            more = False
+            for call_ea in idautils.CodeRefsTo(func.start_ea, True):
+                if len(seen) >= limit:
+                    more = True
+                    break
+                # Only count actual call instructions, not data refs or jump tables
+                insn = idaapi.insn_t()
+                idaapi.decode_insn(insn, call_ea)
+                if insn.itype not in (
+                    idaapi.NN_call, idaapi.NN_callfi, idaapi.NN_callni
+                ):
+                    continue
+                caller_func = idaapi.get_func(call_ea)
+                if not caller_func:
+                    continue
+                cstart = caller_func.start_ea
+                if cstart not in seen:
+                    seen[cstart] = {
+                        "func_addr": hex(cstart),
+                        "func_name": ida_name.get_name(cstart) or f"sub_{cstart:X}",
+                        "call_ea": hex(call_ea),
+                    }
+
+            results.append(
+                {
+                    "addr": hex(func.start_ea),
+                    "name": ida_name.get_name(func.start_ea) or f"sub_{func.start_ea:X}",
+                    "callers": list(seen.values()),
+                    "caller_count": len(seen),
+                    "more": more,
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "addr": fn_addr,
+                    "callers": None,
+                    **item_error(e, f"get_function_callers {fn_addr}"),
+                }
+            )
+
+    return results
+
+
+@tool
+@idasync
+def get_function_signature(
+    addrs: Annotated[
+        list[str] | str,
+        "Function addresses or names (e.g. '0x401000', 'main')",
+    ],
+) -> list[FunctionSignatureResult]:
+    """Return the stored type/prototype string for each function.
+
+    Tries in order: (1) IDB-stored type annotation (instant), (2) Hex-Rays
+    type inference from the decompiled cfunc.  Returns ``has_type: false`` and
+    ``signature: null`` when neither source yields a result — the function
+    either hasn't been analysed by the decompiler yet or needs manual typing.
+
+    ``source`` indicates where the signature came from: ``"idb"``, ``"hexrays"``,
+    or ``"none"``.
+
+    Profile: analysis
+    """
+    addrs = normalize_list_input(addrs)
+    results: list[FunctionSignatureResult] = []
+
+    for fn_addr in addrs:
+        try:
+            start_ea = parse_address(fn_addr)
+            func = idaapi.get_func(start_ea)
+            if not func:
+                results.append(
+                    {
+                        "addr": fn_addr,
+                        "has_type": False,
+                        "signature": None,
+                        **item_error(
+                            ValueError("No function at address"),
+                            f"get_function_signature {fn_addr}",
+                        ),
+                    }
+                )
+                continue
+
+            name = ida_funcs.get_func_name(start_ea) or f"sub_{start_ea:X}"
+            sig: str | None = get_prototype(func)
+            source = "idb" if sig else "none"
+
+            if not sig:
+                try:
+                    import ida_hexrays as _hr
+                    if _hr.init_hexrays_plugin():
+                        cfunc = _hr.decompile(start_ea)
+                        if cfunc and cfunc.type:
+                            raw = str(cfunc.type)
+                            if raw:
+                                sig = raw
+                                source = "hexrays"
+                except Exception:
+                    pass
+
+            results.append(
+                {
+                    "addr": hex(start_ea),
+                    "name": name,
+                    "signature": sig,
+                    "has_type": sig is not None,
+                    "source": source,
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "addr": fn_addr,
+                    "signature": None,
+                    "has_type": False,
+                    **item_error(e, f"get_function_signature {fn_addr}"),
+                }
+            )
+
+    return results
+
+
+@tool
+@idasync
+def get_function_jump_targets(
+    addrs: Annotated[
+        list[str] | str,
+        "Function addresses or names (e.g. '0x401000', 'main')",
+    ],
+) -> list[JumpTargetsResult]:
+    """Return all jump targets from a function's disassembly.
+
+    Each jump entry includes the jump instruction address, the resolved target
+    (or ``null`` for indirect/register jumps), the kind (``unconditional``,
+    ``conditional``, or ``indirect``), and the mnemonic.
+
+    Useful for quick control-flow triage without loading a full CFG or
+    decompiling the function.
+
+    Profile: analysis
+    """
+    addrs = normalize_list_input(addrs)
+    results: list[JumpTargetsResult] = []
+
+    for fn_addr in addrs:
+        try:
+            start_ea = parse_address(fn_addr)
+            func = idaapi.get_func(start_ea)
+            if not func:
+                results.append(
+                    {
+                        "addr": fn_addr,
+                        **item_error(
+                            ValueError("No function at address"),
+                            f"get_function_jump_targets {fn_addr}",
+                        ),
+                    }
+                )
+                continue
+
+            name = ida_funcs.get_func_name(start_ea) or f"sub_{start_ea:X}"
+            jumps: list[JumpTargetItem] = []
+
+            for item_ea in idautils.FuncItems(start_ea):
+                insn = idaapi.insn_t()
+                if not idaapi.decode_insn(insn, item_ea):
+                    continue
+                feat = insn.get_canon_feature()
+                if not (feat & idaapi.CF_JUMP):
+                    continue
+                is_unconditional = bool(feat & idaapi.CF_STOP)
+                op0 = insn.ops[0]
+                is_indirect = op0.type in (idaapi.o_reg, idaapi.o_phrase, idaapi.o_displ)
+                if is_indirect:
+                    kind = "indirect"
+                    target_str = None
+                elif is_unconditional:
+                    kind = "unconditional"
+                    target_str = hex(op0.addr) if op0.addr else None
+                else:
+                    kind = "conditional"
+                    target_str = hex(op0.addr) if op0.addr else None
+                jumps.append(
+                    {
+                        "ea": hex(item_ea),
+                        "target": target_str,
+                        "kind": kind,
+                        "mnemonic": idc.print_insn_mnem(item_ea) or "",
+                    }
+                )
+
+            results.append(
+                {
+                    "addr": hex(start_ea),
+                    "name": name,
+                    "jump_count": len(jumps),
+                    "jumps": jumps,
+                }
+            )
+        except Exception as e:
+            results.append(
+                {"addr": fn_addr, **item_error(e, f"get_function_jump_targets {fn_addr}")}
+            )
+
+    return results
+
+
+@tool
+@idasync
+def get_function_hash(
+    addrs: Annotated[
+        list[str] | str,
+        "Function addresses or names (e.g. '0x401000', 'main')",
+    ],
+) -> list[FunctionHashResult]:
+    """SHA-256 hash of normalised function opcodes.
+
+    Address-type operand bytes (branch targets, memory references,
+    displacements) are zeroed before hashing so the digest is stable across
+    rebased or relocated binaries.  Immediate constants are **kept** so two
+    functions implementing the same algorithm with the same magic numbers still
+    produce the same hash.
+
+    Use ``get_bulk_function_hashes`` for binary-wide scanning.
+
+    Profile: analysis
+    """
+    addrs = normalize_list_input(addrs)
+    results: list[FunctionHashResult] = []
+
+    for fn_addr in addrs:
+        try:
+            start_ea = parse_address(fn_addr)
+            func = idaapi.get_func(start_ea)
+            if not func:
+                results.append(
+                    {
+                        "addr": fn_addr,
+                        **item_error(
+                            ValueError("No function at address"),
+                            f"get_function_hash {fn_addr}",
+                        ),
+                    }
+                )
+                continue
+            name = ida_funcs.get_func_name(start_ea) or f"sub_{start_ea:X}"
+            digest, nbytes, insn_count = _hash_function_bytes(start_ea)
+            results.append(
+                {
+                    "addr": hex(start_ea),
+                    "name": name,
+                    "hash": f"sha256:{digest}",
+                    "normalized_bytes": nbytes,
+                    "instruction_count": insn_count,
+                }
+            )
+        except Exception as e:
+            results.append(
+                {"addr": fn_addr, **item_error(e, f"get_function_hash {fn_addr}")}
+            )
+
+    return results
+
+
+@tool
+@idasync
+@tool_timeout(120.0)
+def get_bulk_function_hashes(
+    filter: Annotated[str, "Glob filter on function name (empty = all)"] = "",
+    offset: Annotated[int, "Start index for pagination (default: 0)"] = 0,
+    count: Annotated[int, "Max functions per page (default: 500)"] = 500,
+    min_instructions: Annotated[
+        int,
+        "Skip functions with fewer than N instructions (default: 5 — filters tiny stubs)",
+    ] = 5,
+) -> BulkHashPage:
+    """Compute SHA-256 normalised hashes for all (or filtered) functions.
+
+    Paginate with ``offset`` + ``count``.  Filter to a name pattern with
+    ``filter``.  Use ``min_instructions`` to skip tiny thunks and trampolines
+    that produce near-identical hashes due to having only 1-2 instructions.
+
+    Heavy: for binaries with >5000 functions use invoke_tool(..., async_mode=True)
+    or task_submit + task_poll.
+
+    Profile: analysis
+    """
+    try:
+        candidates: list[dict] = []
+        for start_ea in idautils.Functions():
+            fn = idaapi.get_func(start_ea)
+            if not fn:
+                continue
+            name = ida_funcs.get_func_name(start_ea) or f"sub_{start_ea:X}"
+            candidates.append({"start_ea": start_ea, "name": name})
+
+        if filter and filter not in ("*", ""):
+            candidates = pattern_filter(candidates, filter, "name")
+
+        total = len(candidates)
+        page_items = candidates[offset: offset + count]
+        data: list[FunctionHashResult] = []
+        for item in page_items:
+            start_ea = item["start_ea"]
+            try:
+                digest, nbytes, insn_count = _hash_function_bytes(start_ea)
+                if insn_count < min_instructions:
+                    continue
+                data.append(
+                    {
+                        "addr": hex(start_ea),
+                        "name": item["name"],
+                        "hash": f"sha256:{digest}",
+                        "normalized_bytes": nbytes,
+                        "instruction_count": insn_count,
+                    }
+                )
+            except Exception as e:
+                data.append(
+                    {
+                        "addr": hex(start_ea),
+                        "name": item["name"],
+                        **item_error(e, f"hash {hex(start_ea)}"),
+                    }
+                )
+
+        next_off = offset + count if offset + count < total else None
+        return {"data": data, "total": total, "next_offset": next_off}
+    except Exception as e:
+        return tool_error(e, context="get_bulk_function_hashes")
+
+
+@tool
+@idasync
+def analyze_function_completeness(
+    addrs: Annotated[
+        list[str] | str,
+        "Function addresses or names (e.g. '0x401000', 'main')",
+    ],
+) -> list[CompletenessResult]:
+    """Score each function's reverse-engineering documentation completeness.
+
+    A 0–100 score is computed from five weighted criteria:
+
+    | Criterion           | Points | What counts                                      |
+    |---------------------|--------|--------------------------------------------------|
+    | Custom name         | 35     | Not ``sub_``/``loc_``/``j_`` auto-generated      |
+    | Type annotation     | 25     | IDB has a stored tinfo prototype                 |
+    | Function comment    | 20     | Regular or repeatable comment at function entry  |
+    | Named stack vars    | 15     | At least one frame var without ``var_``/``arg_`` |
+    | Inline comments     |  5     | Any comment inside the function body             |
+
+    Grades: A ≥ 90, B ≥ 70, C ≥ 40, D ≥ 20, F < 20.
+
+    Profile: analysis
+    """
+    addrs = normalize_list_input(addrs)
+    results: list[CompletenessResult] = []
+    for fn_addr in addrs:
+        try:
+            start_ea = parse_address(fn_addr)
+            results.append(_score_function_completeness(start_ea))
+        except Exception as e:
+            results.append(
+                {"addr": fn_addr, **item_error(e, f"analyze_function_completeness {fn_addr}")}
+            )
+    return results
+
+
+@tool
+@idasync
+@tool_timeout(120.0)
+def batch_analyze_completeness(
+    filter: Annotated[str, "Glob filter on function name (empty = all)"] = "",
+    offset: Annotated[int, "Start index for pagination (default: 0)"] = 0,
+    count: Annotated[int, "Max functions per page (default: 200)"] = 200,
+    min_score: Annotated[int, "Only return functions with score >= N (default: 0)"] = 0,
+    max_score: Annotated[
+        int, "Only return functions with score <= N (default: 100)"
+    ] = 100,
+    sort_by: Annotated[
+        str, "Sort order: 'score' (default, ascending — worst first) or 'addr'"
+    ] = "score",
+) -> BatchCompletenessResult:
+    """Completeness scores for all (or filtered) functions in the IDB.
+
+    Sort by ``score`` (default, ascending) to surface the worst-documented
+    functions first — the ones most worth renaming, commenting, and typing.
+
+    Use ``max_score=59`` to find functions that still need work (grade C or
+    below).  Use ``min_score=90`` to list fully-documented functions.
+
+    Heavy: for large binaries use invoke_tool(..., async_mode=True)
+    or task_submit + task_poll.
+
+    Profile: analysis
+    """
+    try:
+        candidates: list[dict] = []
+        for start_ea in idautils.Functions():
+            fn = idaapi.get_func(start_ea)
+            if not fn:
+                continue
+            name = ida_funcs.get_func_name(start_ea) or f"sub_{start_ea:X}"
+            candidates.append({"start_ea": start_ea, "name": name})
+
+        if filter and filter not in ("*", ""):
+            candidates = pattern_filter(candidates, filter, "name")
+
+        scored: list[CompletenessResult] = []
+        for item in candidates:
+            try:
+                s = _score_function_completeness(item["start_ea"])
+                score_val = s.get("score", 0) or 0
+                if min_score <= score_val <= max_score:
+                    scored.append(s)
+            except Exception as e:
+                scored.append(
+                    {
+                        "addr": hex(item["start_ea"]),
+                        "name": item["name"],
+                        **item_error(e, f"completeness {hex(item['start_ea'])}"),
+                    }
+                )
+
+        if sort_by == "score":
+            scored.sort(key=lambda x: x.get("score") or 0)
+        else:
+            scored.sort(key=lambda x: int(x.get("addr", "0x0"), 16))
+
+        total = len(scored)
+        page_data = scored[offset: offset + count]
+        next_off = offset + count if offset + count < total else None
+
+        scores_only = [x.get("score") or 0 for x in scored if "score" in x]
+        mean_score = round(sum(scores_only) / len(scores_only), 1) if scores_only else 0.0
+        grade_counts: dict[str, int] = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
+        for x in scored:
+            g = x.get("grade", "F") or "F"
+            grade_counts[g] = grade_counts.get(g, 0) + 1
+
+        return {
+            "data": page_data,
+            "total": total,
+            "next_offset": next_off,
+            "mean_score": mean_score,
+            "grade_counts": grade_counts,
+        }
+    except Exception as e:
+        return tool_error(e, context="batch_analyze_completeness")
+
+
+@tool
+@idasync
+@tool_timeout(60.0)
+def diff_functions(
+    addr_a: Annotated[str, "First function address or name"],
+    addr_b: Annotated[str, "Second function address or name"],
+    context_lines: Annotated[
+        int,
+        "Lines of context around each diff hunk (default: 3). "
+        "Set 0 for changed lines only.",
+    ] = 3,
+) -> DiffFunctionsResult:
+    """Side-by-side unified diff of two decompiled functions.
+
+    Decompiles both functions via Hex-Rays and produces a unified diff.
+    ``similarity`` is a 0–1 ratio from Python's ``SequenceMatcher`` — 1.0 means
+    identical pseudocode, 0.0 means completely different.
+
+    Typical uses: patch-diffing two binary versions, comparing inlined/outlined
+    variants, or verifying that a manually-typed prototype changed only comments.
+
+    Profile: analysis
+    """
+    try:
+        start_a = parse_address(addr_a)
+        start_b = parse_address(addr_b)
+        func_a = idaapi.get_func(start_a)
+        func_b = idaapi.get_func(start_b)
+        if not func_a:
+            return tool_error(
+                ValueError(f"No function at {addr_a}"),
+                context="diff_functions",
+                hint="Verify addr_a is a valid function start address.",
+            )
+        if not func_b:
+            return tool_error(
+                ValueError(f"No function at {addr_b}"),
+                context="diff_functions",
+                hint="Verify addr_b is a valid function start address.",
+            )
+
+        name_a = ida_funcs.get_func_name(start_a) or f"sub_{start_a:X}"
+        name_b = ida_funcs.get_func_name(start_b) or f"sub_{start_b:X}"
+
+        code_a = decompile_function_safe(start_a, include_addresses=False)
+        code_b = decompile_function_safe(start_b, include_addresses=False)
+
+        note_parts: list[str] = []
+        if code_a is None:
+            note_parts.append(f"Decompilation failed for {name_a} — diff uses empty string.")
+        if code_b is None:
+            note_parts.append(f"Decompilation failed for {name_b} — diff uses empty string.")
+
+        lines_a = (code_a or "").splitlines()
+        lines_b = (code_b or "").splitlines()
+
+        diff_lines = list(
+            difflib.unified_diff(
+                lines_a,
+                lines_b,
+                fromfile=name_a,
+                tofile=name_b,
+                lineterm="",
+                n=max(0, context_lines),
+            )
+        )
+        similarity = round(
+            difflib.SequenceMatcher(None, lines_a, lines_b).ratio(), 4
+        )
+
+        if similarity == 1.0 and not note_parts:
+            note_parts.append("Functions produce identical pseudocode.")
+
+        return {
+            "ok": True,
+            "addr_a": hex(start_a),
+            "addr_b": hex(start_b),
+            "name_a": name_a,
+            "name_b": name_b,
+            "similarity": similarity,
+            "diff": "\n".join(diff_lines),
+            "diff_line_count": len(diff_lines),
+            "lines_a": len(lines_a),
+            "lines_b": len(lines_b),
+            "note": " ".join(note_parts) if note_parts else "",
+        }
+    except Exception as e:
+        return tool_error(e, context="diff_functions")
 
 
 # ============================================================================
