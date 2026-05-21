@@ -734,6 +734,13 @@ def _resolve_to_graph_node(G, raw_addr) -> int | None:
                     return hex_parsed
             except ValueError:
                 pass
+            # Decimal fallback: agent may pass "5375319936" for integer node IDs
+            try:
+                dec_parsed = int(stripped, 10)
+                if G.has_node(dec_parsed):
+                    return dec_parsed
+            except ValueError:
+                pass
 
     # Normalize to function start
     if parsed is not None:

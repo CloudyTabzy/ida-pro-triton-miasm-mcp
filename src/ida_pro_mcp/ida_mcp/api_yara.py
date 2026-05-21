@@ -918,9 +918,9 @@ if YARA_AVAILABLE:
     def yara_scan_builtin_crypto(
         address: Annotated[str, "IDA start address; empty = whole loaded binary"] = "",
         end_address: Annotated[str, "IDA end address; ignored when address is empty"] = "",
-        algorithms: Annotated[
+        algorithm: Annotated[
             list[str] | str,
-            "Algorithms: aes, md5, sha1, sha256, sha512, crc32, rc4. 'all' = everything",
+            "Algorithm(s): aes, md5, sha1, sha256, sha512, crc32, rc4. 'all' = everything",
         ] = "all",
         scan_executable_sections: Annotated[
             bool,
@@ -936,7 +936,7 @@ if YARA_AVAILABLE:
         produce false matches against short crypto patterns. Pass
         scan_executable_sections=True to override."""
         try:
-            raw_algs = normalize_list_input(algorithms) if isinstance(algorithms, str) else list(algorithms)
+            raw_algs = normalize_list_input(algorithm) if isinstance(algorithm, str) else list(algorithm)
             want_all = (not raw_algs) or (len(raw_algs) == 1 and raw_algs[0].strip().lower() == "all")
             wanted = set(_CRYPTO_ALGORITHM_MAP.keys()) if want_all else {a.strip().lower() for a in raw_algs}
 

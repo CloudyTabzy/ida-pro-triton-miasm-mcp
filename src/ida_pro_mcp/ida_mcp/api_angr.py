@@ -110,12 +110,55 @@ if ANGR_AVAILABLE:
     # running inside IDA's signal-handling context). angr runs inside a daemon
     # thread via _run_with_deadline; Ctrl+C interruption is handled at the
     # MCP server layer, not inside z3.
+    #
+    # Three-layer approach because claripy changed internals across versions:
+    #   1. Replace module-level install/uninstall functions with no-ops.
+    #   2. Reset any integer counter tracking install depth (claripy 9.2+
+    #      uses _handler_depth/_z3_uses; older versions use _installed bool).
+    #   3. Patch BackendZ3 class methods if the logic moved to instance level.
+    _patch_claripy_sigint()
+
+
+def _patch_claripy_sigint() -> None:
+    """Suppress claripy's SIGINT handler install/uninstall in the IDA context."""
     try:
-        import claripy.backends.backend_z3 as _backend_z3
-        _backend_z3.install_sigint_handler = lambda: None
-        _backend_z3.uninstall_sigint_handler = lambda: None
+        import claripy.backends.backend_z3 as _bz3
     except Exception:
-        pass
+        return
+
+    _noop = lambda *a, **kw: None  # noqa: E731
+
+    # Layer 1: patch module-level function names
+    for _fname in ("install_sigint_handler", "uninstall_sigint_handler",
+                   "_install_sigint_handler", "_uninstall_sigint_handler"):
+        if hasattr(_bz3, _fname) and callable(getattr(_bz3, _fname)):
+            try:
+                setattr(_bz3, _fname, _noop)
+            except Exception:
+                pass
+
+    # Layer 2: reset any integer/bool depth counters so a stale counter
+    # (e.g. depth=-1 from a previous crash) can't trigger the assertion.
+    for _cname in ("_handler_depth", "_z3_uses", "_installed",
+                   "_sigint_installed", "_sigint_count"):
+        if hasattr(_bz3, _cname):
+            try:
+                _sentinel = getattr(_bz3, _cname)
+                setattr(_bz3, _cname, 0 if isinstance(_sentinel, int) else False)
+            except Exception:
+                pass
+
+    # Layer 3: patch instance methods on the BackendZ3 class if it exists
+    for _cls_name in ("BackendZ3", "Backend"):
+        _cls = getattr(_bz3, _cls_name, None)
+        if _cls is None:
+            continue
+        for _mname in ("install_sigint_handler", "uninstall_sigint_handler"):
+            if hasattr(_cls, _mname) and callable(getattr(_cls, _mname)):
+                try:
+                    setattr(_cls, _mname, _noop)
+                except Exception:
+                    pass
 
 
 # ============================================================================
@@ -1205,12 +1248,26 @@ if ANGR_AVAILABLE:
             timed_out = False
 
             def _do_explore():
-                try:
+                def _attempt():
                     simgr.explore(
                         find=target_ea,
                         avoid=avoid_eas if avoid_eas else None,
                         num_find=max(1, int(max_paths)),
                     )
+                try:
+                    _attempt()
+                except (KeyboardInterrupt, AssertionError) as _sigint_err:
+                    # claripy SIGINT handler assertion fired despite startup patch —
+                    # re-apply three-layer patch and retry once.
+                    logger.warning(
+                        "angr_find_paths: %s during explore, re-patching claripy and retrying",
+                        type(_sigint_err).__name__,
+                    )
+                    _patch_claripy_sigint()
+                    try:
+                        _attempt()
+                    except Exception as _retry_err:
+                        logger.warning("simgr.explore raised on retry: %s", _retry_err)
                 except Exception as ex:
                     logger.warning("simgr.explore raised: %s", ex)
 

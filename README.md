@@ -269,7 +269,7 @@ Requires: `pip install miasm`
 ### 🐍 Angr — Symbolic Execution (`angr_*`)  ⚠️ Known Issues / TBD
 Requires: `pip install angr` (~200 MB; NOT included in `--install-deps all`)
 
-> **Status:** Integrated but **fragile** with angr 9.2+. `CFGEmulated` crashes during LMDB node serialization, `SpillingCFG` lacks `.neighbors()` (affects path exploration), and SIGINT handler assertions can fail in daemon threads. Defensive patches are in place, but tools below marked with ⚠️ may error or hang on real binaries. Treat this module as **experimental / TBD** — the infrastructure is here but needs angr-version-specific hardening before production use.
+> **Status (2026-05-22):** Several known issues fixed in the latest patch — `SpillingCFG.neighbors()` replaced with manual BFS, the `CFGFast` generator `len()` error resolved, and the claripy SIGINT handler assertion hardened with a three-layer patch (module-level no-ops + counter reset + class-method patch) plus a runtime retry guard that re-applies the patch and retries if an assertion still fires mid-exploration. These fixes have **not yet been stress-tested** on a broad set of binaries; treat this module as **experimental** until a dedicated regression pass confirms stability. Report issues.
 
 **Status probe** (always available, even without angr installed):
 
