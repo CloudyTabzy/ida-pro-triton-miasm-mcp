@@ -33,8 +33,8 @@ AI agents have a dirty secret: every MCP session starts by loading **all 290+ to
 
 | Meta-Tool | What it does |
 |-----------|-------------|
-| `list_modules` | Discover 6 semantic groups (`core`, `analysis`, `modify`, `symbolic`, `formats`, `recon`) |
-| `list_tools(module=...)` | Paginated discovery inside any group |
+| `list_modules` | Discover 6 semantic groups with live tool counts and representative tool names embedded directly in the description |
+| `list_tools(module=..., search=..., limit=50, offset=0)` | Browse a group or search by keyword across all groups |
 | `describe_tool(name)` | Load the full schema for one tool on demand |
 | `invoke_tool(tool, args)` | Execute any tool by name |
 
@@ -44,6 +44,20 @@ The agent pays only **~800 tokens** at session start. When it needs Triton, it a
 ida-pro-mcp --lazy          # GUI plugin mode
 idalib-mcp --stdio --lazy   # Headless mode
 ```
+
+### Optimized for Minimal Round-Trips
+
+The lazy mode implementation goes beyond simple deferral — it is engineered to minimize how much context an agent consumes *getting to the tool call*:
+
+**Embedded group directory.** The `list_modules` description field contains a live-generated directory of all six groups: their current tool counts and the most representative tool names in each. Agents that already know what they want (e.g. `decompile`, `rename`, `triton_init`) can skip `list_modules` entirely and call `invoke_tool` directly. **Zero discovery overhead.**
+
+**Keyword search across all groups.** `list_tools(search='crackme')` returns every tool whose name or description contains that term — across all groups — in a single call. No browsing, no group-by-group iteration. One call to find the right tool, one call to use it.
+
+**Cheapest-first discovery paths:**
+1. **Know the name** → `invoke_tool` directly *(0 discovery calls)*
+2. **Know a keyword** → `list_tools(search='keyword')` → `invoke_tool` *(1 call)*
+3. **Know the group** → `list_tools(module='analysis')` → `invoke_tool` *(1 call)*
+4. **Exploring** → `list_modules` → `list_tools(module=...)` → `invoke_tool` *(2 calls)*
 
 Lazy mode is the default we recommend for Claude, Roo, Cursor, and any client where context is precious. For agents with very large windows (200K+), run without `--lazy` to get all tools upfront.
 
@@ -457,7 +471,27 @@ Requires both Triton and Miasm.
 | `hybrid_iterative_deobfuscate` | Iterative simplification → Triton verification → patch → repeat (`@unsafe`) |
 
 ### 🔄 Async Tasks (`task_*`)
-Submit heavy operations to avoid MCP client timeouts.
+
+Some tools take seconds. Some take minutes. A call-graph build over a large binary, a full angr symbolic exploration, a YARA annotation sweep across 10,000 functions — these are real workloads, not quick lookups. MCP clients enforce connection timeouts that kill long-running calls before they finish, leaving the agent with nothing.
+
+**Synapse MCP ships a first-class async task system built specifically for this.** Heavy tools are marked in their docstrings with `Heavy:` — a signal to the agent that the standard synchronous path may time out and that the task backend is the right choice.
+
+#### The zero-boilerplate path: `invoke_tool` with `async_mode=True`
+
+The simplest way to run a heavy tool without managing task IDs manually:
+
+```python
+invoke_tool(tool='workflow_reveng_overview', args={}, async_mode=True)
+# → same result as the sync call, but the server submits internally,
+#   polls every 2 seconds, and returns the completed result to you.
+#   No task_id to track. No polling loop to write.
+```
+
+The agent just adds one flag. The server handles submission, polling (up to 300 seconds), and result unwrapping transparently. If the operation exceeds the timeout, the response includes the `task_id` so the agent can continue polling manually if needed.
+
+#### The manual path: `task_submit` + `task_poll`
+
+For full control — or when you want to submit multiple jobs in parallel and poll them together:
 
 | Tool | What it does |
 |------|-------------|
@@ -465,6 +499,20 @@ Submit heavy operations to avoid MCP client timeouts.
 | `task_poll` | Poll status + progress → result when `done` |
 | `task_list` | List active/recent tasks with auto-detected category |
 | `task_cancel` | Cancel pending tasks |
+
+```python
+# Submit two heavy jobs in parallel
+id1 = task_submit(tool_name='workflow_reveng_overview', arguments={})["task_id"]
+id2 = task_submit(tool_name='nx_call_graph', arguments={})["task_id"]
+
+# Poll each when ready
+result1 = task_poll(task_id=id1)
+result2 = task_poll(task_id=id2)
+```
+
+#### Which tools need this?
+
+Any tool whose docstring begins with `Heavy:` is a candidate. The current list includes: `analyze_batch`, `callgraph`, `find_similar_functions`, `scan_and_define_funcs`, `nx_call_graph`, `nx_central_functions`, `workflow_reveng_overview`, `workflow_find_critical_paths`, `workflow_binary_diff_summary`, `triton_process_function`, `angr_cfg_fast`, `angr_find_paths`, `workflow_solve_crackme`, and `yara_idb_annotate`. The hint appears in the tool description so agents encounter it naturally at the point of use — no separate documentation to consult.
 
 ---
 
