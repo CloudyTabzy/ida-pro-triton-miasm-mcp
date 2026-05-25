@@ -406,6 +406,7 @@ class LiefImportsResult(TypedDict, total=False):
     total_imports: int
     matched_imports: int
     delay_import_count: int
+    needed_libraries: list[str]   # ELF only: all NEEDED library names from .dynamic
     filter_pattern: str
     library_filter: str
     error: str
@@ -782,12 +783,11 @@ if LIEF_AVAILABLE:
                 }
                 arch = arch_map.get(mach_str, mach_str)
                 imagebase = hex(pe.optional_header.imagebase)
-                ep_rva = (
-                    getattr(pe.optional_header, "addressof_entry_point", None)
-                    or getattr(pe.optional_header, "entry_point", None)
-                    or 0
-                )
-                ep = pe.optional_header.imagebase + ep_rva
+                # pe.entrypoint (inherited from lief.Binary) returns the absolute VA;
+                # the old addressof_entry_point attribute name was wrong — it's
+                # addressof_entrypoint (no underscore), but using the parent property
+                # is simpler and version-stable.
+                ep = pe.entrypoint
                 sub = str(pe.optional_header.subsystem).split(".")[-1]
                 is_exec = "WINDOWS_GUI" in sub or "WINDOWS_CUI" in sub
                 _pe_chars = (
@@ -1115,6 +1115,7 @@ if LIEF_AVAILABLE:
             libs: list[LiefImportLib] = []
             total = 0
             delay_count = 0
+            elf_needed_all: list[str] = []  # populated in the ELF path below
 
             if isinstance(binary, _lief.PE.Binary):
                 pe = binary
@@ -1137,12 +1138,15 @@ if LIEF_AVAILABLE:
                         entries = []
                         for fn in dimp.entries:
                             fname = fn.name if fn.name else None
+                            # DelayImportEntry has no .iat_address (only ImportEntry does);
+                            # .iat_value holds the raw slot value, not the slot VA.
+                            iat_addr = getattr(fn, "iat_address", None)
                             entries.append({
                                 "name": fname,
                                 "ordinal": fn.ordinal if fn.is_ordinal else None,
-                                "iat_address": hex(fn.iat_address) if fn.iat_address else "0x0",
+                                "iat_address": hex(iat_addr) if iat_addr else "0x0",
                                 "is_delay_import": True,
-                                "demangled_name": None,
+                                "demangled_name": _try_demangle(fname) if fname else None,
                             })
                             total += 1
                             delay_count += 1
@@ -1150,12 +1154,15 @@ if LIEF_AVAILABLE:
 
             elif isinstance(binary, _lief.ELF.Binary):
                 elf = binary
-                # Group undefined symbols by NEEDED library
+                # Collect NEEDED library names from the dynamic section
                 needed = [
                     str(de.name) for de in elf.dynamic_entries
                     if getattr(de.tag, "name", str(de.tag)) == "NEEDED"
                 ]
-                # Collect undefined symbols
+                # Collect undefined dynamic symbols (ELF does not map individual symbols
+                # to specific libraries without GNU version info, so all symbols are listed
+                # under a single synthetic entry; library_filter matches against all NEEDED
+                # library names so agents can still filter by library correctly).
                 undef_syms: list[LiefImportEntry] = []
                 for sym in elf.dynamic_symbols:
                     shndx = str(getattr(sym, "shndx", "")).split(".")[-1]
@@ -1168,16 +1175,27 @@ if LIEF_AVAILABLE:
                             "demangled_name": _try_demangle(sym.name),
                         })
                         total += 1
-                # Return as a single synthetic library entry if we can't group properly
-                if needed:
-                    libs.append({"name": " / ".join(needed[:5]), "is_delay_import": False, "functions": undef_syms})
-                elif undef_syms:
-                    libs.append({"name": "(dynamic)", "is_delay_import": False, "functions": undef_syms})
+                # Single entry containing all undefined symbols; name = first NEEDED lib.
+                lib_entry_name = needed[0] if needed else "(dynamic)"
+                if undef_syms or needed:
+                    libs.append({
+                        "name": lib_entry_name,
+                        "is_delay_import": False,
+                        "functions": undef_syms,
+                    })
+                elf_needed_all = needed
 
             # Apply filters
             lib_f = library_filter.lower()
             if lib_f:
-                libs = [lib for lib in libs if lib_f in lib["name"].lower()]
+                # For ELF the single synthetic entry is named after only the first NEEDED
+                # library; match against the full NEEDED list instead so
+                # library_filter="pthread" still finds libpthread symbols.
+                if elf_needed_all:
+                    elf_lib_match = any(lib_f in n.lower() for n in elf_needed_all)
+                    libs = libs if elf_lib_match else []
+                else:
+                    libs = [lib for lib in libs if lib_f in lib["name"].lower()]
             matched = 0
             if pattern:
                 filtered_libs: list[LiefImportLib] = []
@@ -1194,6 +1212,7 @@ if LIEF_AVAILABLE:
                 "ok": True, "format": fmt, "libraries": libs,
                 "total_imports": total, "matched_imports": matched,
                 "delay_import_count": delay_count,
+                **({"needed_libraries": elf_needed_all} if elf_needed_all else {}),
             }
             if pattern:
                 result["filter_pattern"] = pattern
@@ -1263,7 +1282,7 @@ if LIEF_AVAILABLE:
                 r: LiefExportsResult = {
                     "ok": True, "format": "PE",
                     "dll_name": exp.name if exp.name else None,
-                    "base_ordinal": getattr(exp, "base", 0) or 0,
+                    "base_ordinal": getattr(exp, "ordinal_base", 0) or 0,
                     "exports": entries,
                     "total_exports": total_pe,
                     "matched_exports": len(entries),
@@ -1356,22 +1375,30 @@ if LIEF_AVAILABLE:
             if "*" not in fn_p and "?" not in fn_p:
                 fn_p = f"*{fn_p}*"
 
+            def _iter_all_imports():
+                """Yield (imp, is_delay) tuples for regular + delay imports."""
+                for imp in pe.imports:
+                    yield imp, False
+                if hasattr(pe, "delay_imports"):
+                    for imp in pe.delay_imports:
+                        yield imp, True
+
             # Collect all imports from matching DLLs
             candidates: list[dict] = []
-            for imp in list(pe.imports) + [d for d in (
-                list(pe.delay_imports) if hasattr(pe, "delay_imports") else []
-            )]:
-                is_delay = imp in (
-                    list(pe.delay_imports) if hasattr(pe, "delay_imports") else []
-                )
+            for imp, is_delay in _iter_all_imports():
                 if dll_f not in imp.name.lower():
                     continue
                 for fn in imp.entries:
                     fname = fn.name if fn.name else None
+                    # DelayImportEntry has no .iat_address; fall back gracefully.
+                    raw_iat = getattr(fn, "iat_address", None)
+                    iat_str = hex(raw_iat) if raw_iat else "0x0"
+                    iat_idb_str = hex(raw_iat + rebase_delta) if raw_iat else "0x0"
                     if fname and fnmatch.fnmatch(fname.lower(), fn_p):
-                        iat_va = fn.iat_address
-                        iat_va_idb = iat_va + rebase_delta
-                        idb_sym = idc.get_name(iat_va_idb, idc.GN_VISIBLE) or None
+                        idb_sym = (
+                            idc.get_name(raw_iat + rebase_delta, idc.GN_VISIBLE)
+                            if raw_iat else None
+                        ) or None
                         return {
                             "ok": True,
                             "dll_name": imp.name,
@@ -1380,8 +1407,8 @@ if LIEF_AVAILABLE:
                             "ordinal": fn.ordinal if fn.is_ordinal else None,
                             "is_ordinal": bool(fn.is_ordinal),
                             "is_delay_import": is_delay,
-                            "iat_va": hex(iat_va),
-                            "iat_va_idb": hex(iat_va_idb),
+                            "iat_va": iat_str,
+                            "iat_va_idb": iat_idb_str,
                             "idb_name": idb_sym,
                         }
                     if fname:
@@ -1389,8 +1416,8 @@ if LIEF_AVAILABLE:
                             "dll": imp.name,
                             "name": fname,
                             "demangled": _try_demangle(fname),
-                            "iat_va": hex(fn.iat_address),
-                            "iat_va_idb": hex(fn.iat_address + rebase_delta),
+                            "iat_va": iat_str,
+                            "iat_va_idb": iat_idb_str,
                         })
 
             # No exact match — tell agent what IS available in those DLLs
@@ -1516,8 +1543,10 @@ if LIEF_AVAILABLE:
                 return {"ok": True, "format": fmt, "has_tls": False, "callbacks": [], "callback_count": 0}
 
             pe = binary
+            if not pe.has_tls:
+                return {"ok": True, "format": "PE", "has_tls": False, "callbacks": [], "callback_count": 0}
             tls = pe.tls
-            if not tls or not getattr(tls, "has_data_template", False):
+            if tls is None:
                 return {"ok": True, "format": "PE", "has_tls": False, "callbacks": [], "callback_count": 0}
 
             try:
@@ -1526,12 +1555,17 @@ if LIEF_AVAILABLE:
                 start = end = 0
 
             idx_addr = getattr(tls, "addressof_index", 0) or 0
+            pe_imagebase = pe.optional_header.imagebase
+            idb_imagebase = idaapi.get_imagebase()
             cbs: list[LiefTlsCallbackEntry] = []
             for va in (tls.callbacks or []):
-                ida_name = idc.get_name(va) or None
-                if ida_name and _is_auto_name(ida_name):
-                    ida_name = None
-                cbs.append({"address": hex(va), "ida_name": ida_name})
+                # tls.callbacks holds VAs using the PE's declared imagebase; rebase
+                # to IDA's loaded imagebase so the name lookup is correct.
+                va_idb = va - pe_imagebase + idb_imagebase
+                ida_sym = idc.get_name(va_idb) or None
+                if ida_sym and _is_auto_name(ida_sym):
+                    ida_sym = None
+                cbs.append({"address": hex(va), "ida_name": ida_sym})
 
             return {
                 "ok": True, "format": "PE", "has_tls": True,
@@ -1898,25 +1932,27 @@ if LIEF_AVAILABLE:
                     "guard_cf_functions": [], "guard_cf_count": 0, "notes": [],
                 }
 
-            imagebase = pe.optional_header.imagebase
+            pe_imagebase = pe.optional_header.imagebase
+            idb_imagebase = idaapi.get_imagebase()
             guard_funcs = getattr(lc, "guard_cf_functions", []) or []
             entries: list[LiefGuardEntry] = []
 
             for fn in guard_funcs:
                 rva = getattr(fn, "rva", 0) or 0
-                va = imagebase + rva
+                va = pe_imagebase + rva          # static VA from the PE file
+                va_idb = idb_imagebase + rva     # IDA-loaded VA for symbol lookup
                 flags: list[str] = []
                 raw_flags = getattr(fn, "flags", 0) or 0
                 if raw_flags & 0x01: flags.append("FID_SUPPRESSED")
                 if raw_flags & 0x02: flags.append("EXPORT_SUPPRESSED")
                 if raw_flags & 0x04: flags.append("LONGJMP_TARGET")
-                ida_name = idc.get_name(va) or None
-                if ida_name and _is_auto_name(ida_name):
-                    ida_name = None
-                entries.append({"rva": hex(rva), "address": hex(va), "flags": flags, "ida_name": ida_name})
+                ida_sym = idc.get_name(va_idb) or None
+                if ida_sym and _is_auto_name(ida_sym):
+                    ida_sym = None
+                entries.append({"rva": hex(rva), "address": hex(va), "flags": flags, "ida_name": ida_sym})
 
-            lj_targets = [hex(imagebase + getattr(r, "rva", 0)) for r in (getattr(lc, "guard_longjump_targets", []) or [])]
-            eh_targets = [hex(imagebase + getattr(r, "rva", 0)) for r in (getattr(lc, "guard_eh_continuation_targets", []) or [])]
+            lj_targets = [hex(pe_imagebase + getattr(r, "rva", 0)) for r in (getattr(lc, "guard_longjump_targets", []) or [])]
+            eh_targets = [hex(pe_imagebase + getattr(r, "rva", 0)) for r in (getattr(lc, "guard_eh_continuation_targets", []) or [])]
 
             notes: list[str] = []
             if len(entries) > 1000:
@@ -2734,7 +2770,7 @@ if LIEF_AVAILABLE:
                         "address": hex(va), "old_name": ida_name,
                         "new_name": full_name, "applied": False, "source": src,
                     })
-                    applied += 1
+                    # dry_run: nothing actually applied — proposed_count covers this
                 else:
                     ok_flag = bool(idc.set_name(va, full_name, idc.SN_NOWARN | idc.SN_NOCHECK))
                     changes.append({
