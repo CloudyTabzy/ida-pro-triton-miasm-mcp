@@ -16,6 +16,7 @@ import os
 from typing import Annotated, NotRequired, TypedDict
 
 import idaapi
+import ida_name
 import idc
 import idautils
 
@@ -191,6 +192,42 @@ _AUTO_PREFIXES = (
 
 def _is_auto_name(name: str) -> bool:
     return not name or any(name.startswith(p) for p in _AUTO_PREFIXES)
+
+
+def _try_demangle(name: str) -> str | None:
+    """Demangle a C++ symbol name.  Returns None (never a string "None") if
+    demangling fails or produces no improvement over the raw name.
+
+    Strategy:
+    1. LIEF's built-in demangler (lief.demangle / lief.PE.demangle) — present
+       in LIEF 0.15+ but may return None for names it cannot handle.
+    2. IDA's own demangler (ida_name.demangle_name) — always available inside
+       the plugin and handles MSVC ?-mangled names reliably.
+    """
+    if not name:
+        return None
+    # --- LIEF demangler ---
+    try:
+        demangle_fn = (
+            getattr(_lief, "demangle", None)
+            or getattr(getattr(_lief, "PE", None), "demangle", None)
+        )
+        if demangle_fn:
+            result = demangle_fn(name)   # may return None — do NOT str() blindly
+            if result is not None:
+                d = str(result)
+                if d and d != name:
+                    return d
+    except Exception:
+        pass
+    # --- IDA demangler fallback (handles MSVC ?-names that LIEF may miss) ---
+    try:
+        d = ida_name.demangle_name(name, ida_name.MNG_LONG_FORM)
+        if d and d != name:
+            return d
+    except Exception:
+        pass
+    return None
 
 
 # Rich Header product ID table (subset of public database)
@@ -1023,23 +1060,6 @@ if LIEF_AVAILABLE:
             total = 0
             delay_count = 0
 
-            def _try_demangle(name: str) -> str | None:
-                if not name:
-                    return None
-                try:
-                    # LIEF 0.15: lief.demangle(); 0.17: may be at lief.PE.demangle()
-                    demangle_fn = (
-                        getattr(_lief, "demangle", None)
-                        or getattr(getattr(_lief, "PE", None), "demangle", None)
-                    )
-                    if demangle_fn:
-                        d = str(demangle_fn(name))
-                        if d and d != name:
-                            return d
-                except Exception:
-                    pass
-                return None
-
             if isinstance(binary, _lief.PE.Binary):
                 pe = binary
                 for imp in pe.imports:
@@ -1124,23 +1144,6 @@ if LIEF_AVAILABLE:
                 return {**tool_error(ValueError(f"LIEF could not parse: {path}")), "ok": False}
 
             fmt = _format_name(binary)
-
-            def _try_demangle(name: str) -> str | None:
-                if not name:
-                    return None
-                try:
-                    # LIEF 0.15: lief.demangle(); 0.17: may be at lief.PE.demangle()
-                    demangle_fn = (
-                        getattr(_lief, "demangle", None)
-                        or getattr(getattr(_lief, "PE", None), "demangle", None)
-                    )
-                    if demangle_fn:
-                        d = str(demangle_fn(name))
-                        if d and d != name:
-                            return d
-                except Exception:
-                    pass
-                return None
 
             if isinstance(binary, _lief.PE.Binary):
                 pe = binary
